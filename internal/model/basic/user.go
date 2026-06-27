@@ -1,13 +1,16 @@
 package basic
 
-type RegisterRequest struct {
+type Credentials struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
 }
 
+type RegisterRequest struct {
+	Credentials
+}
+
 type LoginRequest struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
+	Credentials
 }
 
 type RegisterResponse struct {

@@ -30,18 +30,18 @@ func (s *Service) Register(req basic.RegisterRequest) error {
 		return ErrInvalidInput
 	}
 
-	defer s.mu.Unlock()
-
-	if _, exists := s.users[req.Email]; exists {
-		return ErrUserExists
-	}
-
 	hashed, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 	if err != nil {
 		return err
 	}
 
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.users[req.Email]; exists {
+		return ErrUserExists
+	}
+
 	s.users[req.Email] = string(hashed)
 	return nil
 }
