@@ -27,7 +27,8 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.svc.Register(basic.RegisterRequest{Credentials: creds}); err != nil {
 		if errors.Is(err, svc.ErrUserExists) {
-			http.Error(w, err.Error(), http.StatusConflict)
+			// I am returning Bad Request instead of StatusConflict just to not expose registered emails
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		if errors.Is(err, svc.ErrInvalidInput) {

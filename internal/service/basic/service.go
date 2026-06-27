@@ -10,10 +10,9 @@ import (
 )
 
 var (
-	ErrUserExists         = errors.New("user already exists")
 	ErrInvalidCredentials = errors.New("invalid credentials")
 	ErrUserNotFound       = errors.New("user not found")
-	ErrInvalidInput       = errors.New("Bad Request")
+	ErrBadRequest         = errors.New("Bad Request")
 )
 
 type Service struct {
@@ -27,7 +26,7 @@ func New() *Service {
 
 func (s *Service) Register(req basic.RegisterRequest) error {
 	if req.Email == "" || req.Password == "" {
-		return ErrInvalidInput
+		return ErrBadRequest
 	}
 
 	hashed, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
@@ -39,7 +38,7 @@ func (s *Service) Register(req basic.RegisterRequest) error {
 	defer s.mu.Unlock()
 
 	if _, exists := s.users[req.Email]; exists {
-		return ErrUserExists
+		return ErrBadRequest
 	}
 
 	s.users[req.Email] = string(hashed)
@@ -48,7 +47,7 @@ func (s *Service) Register(req basic.RegisterRequest) error {
 
 func (s *Service) Login(req basic.LoginRequest) error {
 	if req.Email == "" || req.Password == "" {
-		return ErrInvalidInput
+		return ErrBadRequest
 	}
 
 	s.mu.RLock()
