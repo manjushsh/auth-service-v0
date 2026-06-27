@@ -1,19 +1,23 @@
 package main
 
 import (
-	"fmt"
+	"context"
+	"database/sql"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	_ "github.com/joho/godotenv/autoload"
 
 	"github.com/manjushsh/auth-service/db"
-	basicHandler "github.com/manjushsh/auth-service/internal/handler/basic"
-	"github.com/manjushsh/auth-service/internal/middleware"
-	basicService "github.com/manjushsh/auth-service/internal/service/basic"
-	basicStore "github.com/manjushsh/auth-service/internal/store/basic"
 )
+
+type dependencies struct {
+	db *sql.DB
+}
 
 func main() {
 	dsn := os.Getenv("DATABASE_URL")
@@ -25,31 +29,39 @@ func main() {
 	if err != nil {
 		log.Fatalf("connect to db: %v", err)
 	}
-	log.Println("connected to db")
 	defer database.Close()
+	log.Println("connected to db")
 
 	if err := db.RunMigrations(database); err != nil {
 		log.Fatalf("run migrations: %v", err)
 	}
 	log.Println("migrations applied")
 
-	mux := http.NewServeMux()
-
-	// Basic auth handlers and services
-	// basicSvc := basicService.New(basicStore.NewMemoryStore())
-	basicSvc := basicService.New(basicStore.NewPostgresStore(database))
-	basicH := basicHandler.New(basicSvc)
-
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintln(w, `{"status":"ok"}`)
-	})
-	mux.HandleFunc("/api/basic/register", basicH.Register)
-	mux.HandleFunc("/api/basic/login", basicH.Login)
-
-	addr := ":8080"
-	log.Printf("starting server on %s", addr)
-	if err := http.ListenAndServe(addr, middleware.Logger(mux)); err != nil {
-		log.Fatal(err)
+	srv := &http.Server{
+		Addr:         ":8080",
+		Handler:      newHandler(&dependencies{db: database}),
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
+
+	go func() {
+		log.Printf("starting server on %s", srv.Addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("server error: %v", err)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	log.Println("shutdown signal received")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Fatalf("forced shutdown: %v", err)
+	}
+	log.Println("server stopped")
 }
