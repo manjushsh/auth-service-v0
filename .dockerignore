@@ -1,0 +1,8 @@
+.git
+.env
+tmp/
+*.md
+.air.toml
+.air.docker.toml
+.gitignore
+.dockerignore
