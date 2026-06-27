@@ -2,29 +2,27 @@ package basic
 
 import (
 	"errors"
-	"sync"
 
 	"golang.org/x/crypto/bcrypt"
 
-	"github.com/manjushsh/auth-service/internal/model/basic"
+	model "github.com/manjushsh/auth-service/internal/model/basic"
+	store "github.com/manjushsh/auth-service/internal/store/basic"
 )
 
 var (
 	ErrInvalidCredentials = errors.New("invalid credentials")
-	ErrUserNotFound       = errors.New("user not found")
-	ErrBadRequest         = errors.New("Bad Request")
+	ErrBadRequest         = errors.New("bad request")
 )
 
 type Service struct {
-	mu    sync.RWMutex
-	users map[string]string // email -> hashedPassword
+	store store.Store
 }
 
-func New() *Service {
-	return &Service{users: make(map[string]string)}
+func New(s store.Store) *Service {
+	return &Service{store: s}
 }
 
-func (s *Service) Register(req basic.RegisterRequest) error {
+func (s *Service) Register(req model.RegisterRequest) error {
 	if req.Email == "" || req.Password == "" {
 		return ErrBadRequest
 	}
@@ -34,33 +32,27 @@ func (s *Service) Register(req basic.RegisterRequest) error {
 		return err
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if _, exists := s.users[req.Email]; exists {
-		return ErrBadRequest
+	if err := s.store.CreateUser(req.Email, string(hashed)); err != nil {
+		if errors.Is(err, store.ErrDuplicate) {
+			return ErrBadRequest
+		}
+		return err
 	}
-
-	s.users[req.Email] = string(hashed)
 	return nil
 }
 
-func (s *Service) Login(req basic.LoginRequest) error {
+func (s *Service) Login(req model.LoginRequest) error {
 	if req.Email == "" || req.Password == "" {
 		return ErrBadRequest
 	}
 
-	s.mu.RLock()
-	hashed, ok := s.users[req.Email]
-	s.mu.RUnlock()
-
-	if !ok {
+	hashed, err := s.store.GetHashedPassword(req.Email)
+	if err != nil {
 		return ErrInvalidCredentials
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(hashed), []byte(req.Password)); err != nil {
 		return ErrInvalidCredentials
 	}
-
 	return nil
 }

@@ -26,12 +26,12 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.svc.Register(basic.RegisterRequest{Credentials: creds}); err != nil {
-		if errors.Is(err, svc.ErrUserExists) {
+		if errors.Is(err, svc.ErrBadRequest) {
 			// I am returning Bad Request instead of StatusConflict just to not expose registered emails
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if errors.Is(err, svc.ErrInvalidInput) {
+		if errors.Is(err, svc.ErrBadRequest) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -52,7 +52,7 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.svc.Login(basic.LoginRequest{Credentials: creds}); err != nil {
-		if errors.Is(err, svc.ErrInvalidInput) {
+		if errors.Is(err, svc.ErrBadRequest) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
