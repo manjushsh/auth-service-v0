@@ -43,3 +43,15 @@ func (s *PostgresStore) GetUser(email string) (model.UserRecord, error) {
 	}
 	return u, err
 }
+
+func (s *PostgresStore) ValidateRedirectURI(redirectURI string) error {
+	var id string
+	err := s.db.QueryRow(
+		`SELECT id FROM clients WHERE redirect_uri = $1`,
+		redirectURI,
+	).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	return err
+}

@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Create Account</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="card">
+    <h1>Create Account</h1>
+
+    {{if .Error}}
+    <div class="error">{{.Error}}</div>
+    {{end}}
+
+    <form method="POST" action="/register">
+      <input type="hidden" name="redirect_uri" value="{{.RedirectURI}}">
+      <input type="hidden" name="csrf_token"   value="{{.CSRFToken}}">
+
+      <label class="field">
+        <span class="field__label">Email</span>
+        <input class="field__input" type="email" name="email" required autofocus autocomplete="email">
+      </label>
+      <label class="field">
+        <span class="field__label">Password</span>
+        <input class="field__input" type="password" name="password" required autocomplete="new-password" minlength="8">
+      </label>
+
+      <button class="btn" type="submit">Create Account</button>
+    </form>
+
+    <div class="footer">
+      Already have an account?
+      <a href="/login?redirect_uri={{.RedirectURI}}">Sign in</a>
+    </div>
+  </div>
+</body>
+</html>
