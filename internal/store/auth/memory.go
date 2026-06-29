@@ -1,6 +1,10 @@
-package basic
+package auth
 
-import "sync"
+import (
+	"sync"
+
+	model "github.com/manjushsh/auth-service/internal/model/auth"
+)
 
 type MemoryStore struct {
 	mu    sync.RWMutex
@@ -22,13 +26,14 @@ func (s *MemoryStore) CreateUser(email, hashedPassword string) error {
 	return nil
 }
 
-func (s *MemoryStore) GetHashedPassword(email string) (string, error) {
+func (s *MemoryStore) GetUser(email string) (model.UserRecord, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	hashed, ok := s.users[email]
 	if !ok {
-		return "", ErrNotFound
+		return model.UserRecord{}, ErrNotFound
 	}
-	return hashed, nil
+	// Memory store has no UUIDs so use email as the identifier.
+	return model.UserRecord{ID: email, PasswordHash: hashed}, nil
 }

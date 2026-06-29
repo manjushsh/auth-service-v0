@@ -1,6 +1,10 @@
-package basic
+package auth
 
-import "errors"
+import (
+	"errors"
+
+	model "github.com/manjushsh/auth-service/internal/model/auth"
+)
 
 var (
 	ErrDuplicate = errors.New("user already exists")
@@ -9,5 +13,5 @@ var (
 
 type Store interface {
 	CreateUser(email, hashedPassword string) error
-	GetHashedPassword(email string) (string, error)
+	GetUser(email string) (model.UserRecord, error)
 }
