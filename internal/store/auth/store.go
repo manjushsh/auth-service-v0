@@ -14,4 +14,5 @@ var (
 type Store interface {
 	CreateUser(email, hashedPassword string) error
 	GetUser(email string) (model.UserRecord, error)
+	ValidateRedirectURI(redirectURI string) error
 }

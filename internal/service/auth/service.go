@@ -27,6 +27,7 @@ var (
 	ErrBadRequest         = errors.New("bad request")
 	ErrInvalidCode        = errors.New("invalid or expired code")
 	ErrInvalidToken       = errors.New("invalid token")
+	ErrUnauthorizedClient = errors.New("unauthorized redirect URI")
 )
 
 type Service struct {
@@ -181,6 +182,13 @@ func (s *Service) parseToken(tokenString string) (*jwt.RegisteredClaims, error) 
 		return nil, errors.New("missing jti claim")
 	}
 	return claims, nil
+}
+
+func (s *Service) ValidateRedirectURI(redirectURI string) error {
+	if err := s.store.ValidateRedirectURI(redirectURI); err != nil {
+		return ErrUnauthorizedClient
+	}
+	return nil
 }
 
 func randomString() (string, error) {
