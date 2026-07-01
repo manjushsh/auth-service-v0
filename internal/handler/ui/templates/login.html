@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sign In</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="card">
+    <h1>Sign In</h1>
+
+    {{if .Error}}
+    <div class="error">{{.Error}}</div>
+    {{end}}
+
+    <form method="POST" action="/login">
+      <input type="hidden" name="redirect_uri" value="{{.RedirectURI}}">
+      <input type="hidden" name="csrf_token"   value="{{.CSRFToken}}">
+
+      <label class="field">
+        <span class="field__label">Email</span>
+        <input class="field__input" type="email" name="email" required autofocus autocomplete="email">
+      </label>
+      <label class="field">
+        <span class="field__label">Password</span>
+        <input class="field__input" type="password" name="password" required autocomplete="current-password">
+      </label>
+
+      <button class="btn" type="submit">Sign In</button>
+    </form>
+
+    <div class="footer">
+      Don't have an account?
+      <a href="/register?redirect_uri={{.RedirectURI}}">Create one</a>
+    </div>
+  </div>
+</body>
+</html>
