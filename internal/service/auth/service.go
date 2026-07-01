@@ -14,12 +14,13 @@ import (
 
 	model "github.com/manjushsh/auth-service/internal/model/auth"
 	store "github.com/manjushsh/auth-service/internal/store/auth"
-	codeStore "github.com/manjushsh/auth-service/internal/store/code"
 )
 
 const (
-	codeTTL  = 60 * time.Second
-	tokenTTL = time.Hour
+	codeTTL          = 60 * time.Second
+	tokenTTL         = time.Hour
+	maxLoginAttempts = 5
+	lockoutDuration  = 15 * time.Minute
 )
 
 var (
@@ -28,17 +29,19 @@ var (
 	ErrInvalidCode        = errors.New("invalid or expired code")
 	ErrInvalidToken       = errors.New("invalid token")
 	ErrUnauthorizedClient = errors.New("unauthorized redirect URI")
+	ErrAccountLocked      = errors.New("account locked due to too many failed attempts")
 )
 
 type Service struct {
 	store     store.Store
-	codeStore codeStore.Store
-	blocklist codeStore.Blocklist
+	codeStore codeStore
+	blocklist blocklist
+	locker    locker
 	jwtSecret []byte
 }
 
-func New(s store.Store, cs codeStore.Store, bl codeStore.Blocklist, jwtSecret []byte) *Service {
-	return &Service{store: s, codeStore: cs, blocklist: bl, jwtSecret: jwtSecret}
+func New(s store.Store, cs codeStore, bl blocklist, lk locker, jwtSecret []byte) *Service {
+	return &Service{store: s, codeStore: cs, blocklist: bl, locker: lk, jwtSecret: jwtSecret}
 }
 
 func (s *Service) Register(req model.RegisterRequest) error {
@@ -65,14 +68,27 @@ func (s *Service) GenerateCode(ctx context.Context, req model.GenerateCodeReques
 		return model.GenerateCodeResponse{}, ErrBadRequest
 	}
 
+	locked, err := s.locker.IsLocked(ctx, req.Email)
+	if err != nil {
+		return model.GenerateCodeResponse{}, err
+	}
+	if locked {
+		return model.GenerateCodeResponse{}, ErrAccountLocked
+	}
+
 	u, err := s.store.GetUser(req.Email)
 	if err != nil {
+		s.recordFailedAttempt(ctx, req.Email)
 		return model.GenerateCodeResponse{}, ErrInvalidCredentials
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(req.Password)); err != nil {
+		s.recordFailedAttempt(ctx, req.Email)
 		return model.GenerateCodeResponse{}, ErrInvalidCredentials
 	}
+
+	// Successful login — clear any previous failed attempts.
+	s.locker.ClearFailedAttempts(ctx, req.Email)
 
 	code, err := randomString()
 	if err != nil {
@@ -189,6 +205,17 @@ func (s *Service) ValidateRedirectURI(redirectURI string) error {
 		return ErrUnauthorizedClient
 	}
 	return nil
+}
+
+// recordFailedAttempt increments the failure counter and locks the account on threshold.
+func (s *Service) recordFailedAttempt(ctx context.Context, email string) {
+	attempts, err := s.locker.RecordFailedAttempt(ctx, email)
+	if err != nil {
+		return
+	}
+	if attempts >= maxLoginAttempts {
+		s.locker.LockAccount(ctx, email, lockoutDuration)
+	}
 }
 
 func randomString() (string, error) {

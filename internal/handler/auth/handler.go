@@ -55,6 +55,10 @@ func (h *Handler) GenerateCode(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid credentials", http.StatusUnauthorized)
 			return
 		}
+		if errors.Is(err, svc.ErrAccountLocked) {
+			http.Error(w, "account locked, try again later", http.StatusTooManyRequests)
+			return
+		}
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
