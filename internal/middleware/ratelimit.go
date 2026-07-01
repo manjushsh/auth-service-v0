@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 )
 
-// RateLimiter is the subset of codeStore.RateLimiter needed by the middleware.
 type RateLimiter interface {
 	Allow(ctx context.Context, key string, limit int, window time.Duration) (bool, error)
 }
@@ -42,12 +42,8 @@ func RateLimit(rl RateLimiter, limit int, window time.Duration) func(http.Handle
 // realIP extracts the client IP from proxy headers or the remote address.
 func realIP(r *http.Request) string {
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// X-Forwarded-For can be a comma-separated list; the leftmost is the client.
-		host, _, _ := net.SplitHostPort(xff)
-		if host != "" {
-			return host
-		}
-		return xff
+		// X-Forwarded-For is a comma-separated list; leftmost entry is the client.
+		return strings.TrimSpace(strings.SplitN(xff, ",", 2)[0])
 	}
 	if xri := r.Header.Get("X-Real-IP"); xri != "" {
 		return xri

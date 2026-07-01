@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log"
@@ -11,11 +12,19 @@ import (
 	svc "github.com/manjushsh/auth-service/internal/service/auth"
 )
 
-type Handler struct {
-	svc *svc.Service
+type service interface {
+	Register(req model.RegisterRequest) error
+	GenerateCode(ctx context.Context, req model.GenerateCodeRequest) (model.GenerateCodeResponse, error)
+	ExchangeCode(ctx context.Context, req model.ExchangeTokenRequest) (model.ExchangeTokenResponse, error)
+	Logout(ctx context.Context, tokenString string) error
+	Introspect(ctx context.Context, tokenString string) (model.IntrospectResponse, error)
 }
 
-func New(s *svc.Service) *Handler {
+type Handler struct {
+	svc service
+}
+
+func New(s service) *Handler {
 	return &Handler{svc: s}
 }
 
@@ -110,13 +119,13 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) Introspect(w http.ResponseWriter, r *http.Request) {
-	var req model.IntrospectRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+	token := extractBearerToken(r)
+	if token == "" {
+		http.Error(w, "missing or malformed authorization header", http.StatusBadRequest)
 		return
 	}
 
-	resp, err := h.svc.Introspect(r.Context(), req.Token)
+	resp, err := h.svc.Introspect(r.Context(), token)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -126,8 +135,7 @@ func (h *Handler) Introspect(w http.ResponseWriter, r *http.Request) {
 }
 
 func extractBearerToken(r *http.Request) string {
-	auth := r.Header.Get("Authorization")
-	token, found := strings.CutPrefix(auth, "Bearer ")
+	token, found := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if !found {
 		return ""
 	}

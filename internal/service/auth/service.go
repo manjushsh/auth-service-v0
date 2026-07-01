@@ -209,7 +209,7 @@ func (s *Service) ValidateRedirectURI(redirectURI string) error {
 
 // recordFailedAttempt increments the failure counter and locks the account on threshold.
 func (s *Service) recordFailedAttempt(ctx context.Context, email string) {
-	attempts, err := s.locker.RecordFailedAttempt(ctx, email)
+	attempts, err := s.locker.RecordFailedAttempt(ctx, email, lockoutDuration)
 	if err != nil {
 		return
 	}

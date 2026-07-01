@@ -13,7 +13,7 @@ func (s *RedisStore) IsLocked(ctx context.Context, email string) (bool, error) {
 	return n > 0, nil
 }
 
-func (s *RedisStore) RecordFailedAttempt(ctx context.Context, email string) (int, error) {
+func (s *RedisStore) RecordFailedAttempt(ctx context.Context, email string, ttl time.Duration) (int, error) {
 	key := attemptsKey(email)
 	count, err := s.client.Incr(ctx, key).Result()
 	if err != nil {
@@ -21,7 +21,7 @@ func (s *RedisStore) RecordFailedAttempt(ctx context.Context, email string) (int
 	}
 	// Set TTL on first increment so stale counters don't accumulate.
 	if count == 1 {
-		s.client.Expire(ctx, key, 15*time.Minute)
+		s.client.Expire(ctx, key, ttl)
 	}
 	return int(count), nil
 }

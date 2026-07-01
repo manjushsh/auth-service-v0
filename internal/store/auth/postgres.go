@@ -5,8 +5,6 @@ import (
 	"errors"
 
 	"github.com/lib/pq"
-
-	model "github.com/manjushsh/auth-service/internal/model/auth"
 )
 
 type PostgresStore struct {
@@ -32,14 +30,14 @@ func (s *PostgresStore) CreateUser(email, hashedPassword string) error {
 	return nil
 }
 
-func (s *PostgresStore) GetUser(email string) (model.UserRecord, error) {
-	var u model.UserRecord
+func (s *PostgresStore) GetUser(email string) (UserRecord, error) {
+	var u UserRecord
 	err := s.db.QueryRow(
 		`SELECT id, password_hash FROM users WHERE email = $1`,
 		email,
 	).Scan(&u.ID, &u.PasswordHash)
 	if errors.Is(err, sql.ErrNoRows) {
-		return model.UserRecord{}, ErrNotFound
+		return UserRecord{}, ErrNotFound
 	}
 	return u, err
 }

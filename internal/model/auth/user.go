@@ -5,11 +5,6 @@ type Credentials struct {
 	Password string `json:"password"`
 }
 
-type UserRecord struct {
-	ID           string
-	PasswordHash string
-}
-
 type RegisterRequest struct {
 	Credentials
 }
@@ -36,10 +31,6 @@ type ExchangeTokenRequest struct {
 type ExchangeTokenResponse struct {
 	Token     string `json:"token"`
 	ExpiresIn int    `json:"expires_in"`
-}
-
-type IntrospectRequest struct {
-	Token string `json:"token"`
 }
 
 type IntrospectResponse struct {

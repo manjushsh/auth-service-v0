@@ -1,14 +1,10 @@
 package auth
 
-import (
-	"sync"
-
-	model "github.com/manjushsh/auth-service/internal/model/auth"
-)
+import "sync"
 
 type MemoryStore struct {
-	mu              sync.RWMutex
-	users           map[string]string // email -> hashedPassword
+	mu               sync.RWMutex
+	users            map[string]string // email -> hashedPassword
 	allowedRedirects map[string]bool
 }
 
@@ -18,7 +14,7 @@ func NewMemoryStore(allowedRedirects ...string) *MemoryStore {
 		allowed[uri] = true
 	}
 	return &MemoryStore{
-		users:           make(map[string]string),
+		users:            make(map[string]string),
 		allowedRedirects: allowed,
 	}
 }
@@ -34,20 +30,20 @@ func (s *MemoryStore) CreateUser(email, hashedPassword string) error {
 	return nil
 }
 
-func (s *MemoryStore) GetUser(email string) (model.UserRecord, error) {
+func (s *MemoryStore) GetUser(email string) (UserRecord, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	hashed, ok := s.users[email]
 	if !ok {
-		return model.UserRecord{}, ErrNotFound
+		return UserRecord{}, ErrNotFound
 	}
 	// Memory store has no UUIDs so use email as the identifier.
-	return model.UserRecord{ID: email, PasswordHash: hashed}, nil
+	return UserRecord{ID: email, PasswordHash: hashed}, nil
 }
 
 func (s *MemoryStore) ValidateRedirectURI(redirectURI string) error {
-	// Empty allowlist means accept all — useful for local dev/testing.
+	// Empty allowlist means accept all, for local dev/testing.
 	if len(s.allowedRedirects) == 0 || s.allowedRedirects[redirectURI] {
 		return nil
 	}

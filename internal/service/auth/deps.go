@@ -17,7 +17,7 @@ type blocklist interface {
 
 type locker interface {
 	IsLocked(ctx context.Context, email string) (bool, error)
-	RecordFailedAttempt(ctx context.Context, email string) (int, error)
+	RecordFailedAttempt(ctx context.Context, email string, ttl time.Duration) (int, error)
 	LockAccount(ctx context.Context, email string, ttl time.Duration) error
 	ClearFailedAttempts(ctx context.Context, email string) error
 }

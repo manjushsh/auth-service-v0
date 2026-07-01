@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"crypto/rand"
 	"embed"
 	"encoding/hex"
@@ -34,11 +35,17 @@ type pageData struct {
 	Error       string
 }
 
-type Handler struct {
-	svc *svc.Service
+type service interface {
+	ValidateRedirectURI(redirectURI string) error
+	GenerateCode(ctx context.Context, req model.GenerateCodeRequest) (model.GenerateCodeResponse, error)
+	Register(req model.RegisterRequest) error
 }
 
-func New(s *svc.Service) *Handler {
+type Handler struct {
+	svc service
+}
+
+func New(s service) *Handler {
 	return &Handler{svc: s}
 }
 
@@ -146,12 +153,10 @@ func (h *Handler) RegisterSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Redirect to login so the user can get a code.....
 	loginURL := "/login?" + url.Values{"redirect_uri": {redirectURI}}.Encode()
 	http.Redirect(w, r, loginURL, http.StatusFound)
 }
 
-// newCSRFToken generates a random token, sets it as an HttpOnly cookie, and returns it for the form.
 func newCSRFToken(w http.ResponseWriter) (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
@@ -168,7 +173,6 @@ func newCSRFToken(w http.ResponseWriter) (string, error) {
 	return token, nil
 }
 
-// validCSRF checks that the form's csrf_token matches the cookie.
 func validCSRF(r *http.Request) bool {
 	cookie, err := r.Cookie("csrf_token")
 	if err != nil {
