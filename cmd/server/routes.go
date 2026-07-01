@@ -21,9 +21,11 @@ func newHandler(deps *dependencies) http.Handler {
 	// API handlers
 	authH := authHandler.New(authSvc)
 	mux.HandleFunc("POST /api/auth/register", authH.Register)
+	// Login and code routes are same. Just kept for API so that won't get confused
+	mux.HandleFunc("POST /api/auth/login", authH.GenerateCode)
 	mux.HandleFunc("POST /api/auth/code", authH.GenerateCode)
 	mux.HandleFunc("POST /api/auth/token", authH.ExchangeToken)
-	mux.HandleFunc("GET /api/auth/logout", authH.Logout)
+	mux.HandleFunc("POST /api/auth/logout", authH.Logout)
 	mux.HandleFunc("POST /api/auth/introspect", authH.Introspect)
 
 	// UI handlers
