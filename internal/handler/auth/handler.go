@@ -13,7 +13,7 @@ import (
 )
 
 type service interface {
-	Register(req model.RegisterRequest) error
+	Register(ctx context.Context, req model.RegisterRequest) error
 	GenerateCode(ctx context.Context, req model.GenerateCodeRequest) (model.GenerateCodeResponse, error)
 	ExchangeCode(ctx context.Context, req model.ExchangeTokenRequest) (model.ExchangeTokenResponse, error)
 	Logout(ctx context.Context, tokenString string) error
@@ -35,7 +35,7 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.svc.Register(req); err != nil {
+	if err := h.svc.Register(r.Context(), req); err != nil {
 		if errors.Is(err, svc.ErrBadRequest) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -66,6 +66,10 @@ func (h *Handler) GenerateCode(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, svc.ErrAccountLocked) {
 			http.Error(w, "account locked, try again later", http.StatusTooManyRequests)
+			return
+		}
+		if errors.Is(err, svc.ErrUnauthorizedClient) {
+			http.Error(w, "unauthorized redirect_uri", http.StatusBadRequest)
 			return
 		}
 		http.Error(w, "internal error", http.StatusInternalServerError)

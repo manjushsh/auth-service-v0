@@ -1,6 +1,9 @@
 package auth
 
-import "sync"
+import (
+	"context"
+	"sync"
+)
 
 type MemoryStore struct {
 	mu               sync.RWMutex
@@ -19,7 +22,7 @@ func NewMemoryStore(allowedRedirects ...string) *MemoryStore {
 	}
 }
 
-func (s *MemoryStore) CreateUser(email, hashedPassword string) error {
+func (s *MemoryStore) CreateUser(ctx context.Context, email, hashedPassword string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -30,7 +33,7 @@ func (s *MemoryStore) CreateUser(email, hashedPassword string) error {
 	return nil
 }
 
-func (s *MemoryStore) GetUser(email string) (UserRecord, error) {
+func (s *MemoryStore) GetUser(ctx context.Context, email string) (UserRecord, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -42,7 +45,7 @@ func (s *MemoryStore) GetUser(email string) (UserRecord, error) {
 	return UserRecord{ID: email, PasswordHash: hashed}, nil
 }
 
-func (s *MemoryStore) ValidateRedirectURI(redirectURI string) error {
+func (s *MemoryStore) ValidateRedirectURI(ctx context.Context, redirectURI string) error {
 	// Empty allowlist means accept all, for local dev/testing.
 	if len(s.allowedRedirects) == 0 || s.allowedRedirects[redirectURI] {
 		return nil

@@ -33,14 +33,19 @@ services:
       retries: 5
 
   app:
-    build: .
+    build:
+      context: .
+      target: dev
     restart: unless-stopped
     ports:
       - "8080:8080"
+    volumes:
+      - .:/app
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER:-auth}:${POSTGRES_PASSWORD:-secret}@postgres:5432/${POSTGRES_DB:-authdb}?sslmode=disable
       REDIS_URL: redis://redis:6379
       JWT_SECRET: ${JWT_SECRET}
+      INSECURE_COOKIES: ${INSECURE_COOKIES:-true}
     depends_on:
       postgres:
         condition: service_healthy

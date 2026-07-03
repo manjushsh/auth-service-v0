@@ -3,6 +3,7 @@ package middleware
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -23,7 +24,9 @@ func RateLimit(rl RateLimiter, limit int, window time.Duration) func(http.Handle
 
 			allowed, err := rl.Allow(r.Context(), key, limit, window)
 			if err != nil {
-				// Fail open: don't block requests on Redis errors.
+				// Fail open: don't block requests on Redis errors, but log it
+				// since silent failures here mean rate limiting is off.
+				log.Printf("ratelimit: %s: %v", key, err)
 				next.ServeHTTP(w, r)
 				return
 			}

@@ -17,9 +17,10 @@ import (
 )
 
 type dependencies struct {
-	db        *sql.DB
-	redis     *redis.Client
-	jwtSecret []byte
+	db            *sql.DB
+	redis         *redis.Client
+	jwtSecret     []byte
+	secureCookies bool
 }
 
 func main() {
@@ -60,13 +61,21 @@ func main() {
 	defer redisClient.Close()
 	log.Println("connected to redis")
 
+	insecureCookies := os.Getenv("INSECURE_COOKIES") == "true"
+
+	handler, err := newHandler(&dependencies{
+		db:            database,
+		redis:         redisClient,
+		jwtSecret:     []byte(jwtSecret),
+		secureCookies: !insecureCookies,
+	})
+	if err != nil {
+		log.Fatalf("build handler: %v", err)
+	}
+
 	srv := &http.Server{
-		Addr: ":8080",
-		Handler: newHandler(&dependencies{
-			db:        database,
-			redis:     redisClient,
-			jwtSecret: []byte(jwtSecret),
-		}),
+		Addr:         ":8080",
+		Handler:      handler,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  60 * time.Second,

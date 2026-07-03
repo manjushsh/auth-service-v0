@@ -13,14 +13,21 @@ import (
 	redisStore "github.com/manjushsh/auth-service/internal/store/redis"
 )
 
-func newHandler(deps *dependencies) http.Handler {
+const maxRequestBodyBytes = 1 << 20 // 1 MiB
+
+func newHandler(deps *dependencies) (http.Handler, error) {
 	mux := http.NewServeMux()
 
 	cs := redisStore.NewRedisStore(deps.redis)
-	authSvc := authService.New(authStore.NewPostgresStore(deps.db), cs, cs, cs, deps.jwtSecret)
+	authSvc, err := authService.New(authStore.NewPostgresStore(deps.db), cs, cs, cs, deps.jwtSecret)
+	if err != nil {
+		return nil, err
+	}
 
 	// Rate limiter: 10 requests per minute per IP per endpoint.
 	rl := middleware.RateLimit(cs, 10, time.Minute)
+	// Token exchange is guessable-secret sensitive; keep it tighter.
+	rlToken := middleware.RateLimit(cs, 30, time.Minute)
 
 	// API handlers
 	authH := authHandler.New(authSvc)
@@ -28,16 +35,16 @@ func newHandler(deps *dependencies) http.Handler {
 	// Login and code routes are same. Just kept for API so that won't get confused
 	mux.Handle("POST /api/auth/login", rl(http.HandlerFunc(authH.GenerateCode)))
 	mux.Handle("POST /api/auth/code", rl(http.HandlerFunc(authH.GenerateCode)))
-	mux.HandleFunc("POST /api/auth/token", authH.ExchangeToken)
-	mux.HandleFunc("POST /api/auth/logout", authH.Logout)
-	mux.HandleFunc("POST /api/auth/introspect", authH.Introspect)
+	mux.Handle("POST /api/auth/token", rlToken(http.HandlerFunc(authH.ExchangeToken)))
+	mux.Handle("POST /api/auth/logout", rlToken(http.HandlerFunc(authH.Logout)))
+	mux.Handle("POST /api/auth/introspect", rlToken(http.HandlerFunc(authH.Introspect)))
 
 	// UI handlers
-	uiH := uiHandler.New(authSvc)
+	uiH := uiHandler.New(authSvc, deps.secureCookies)
 	mux.HandleFunc("GET /login", uiH.LoginPage)
-	mux.HandleFunc("POST /login", uiH.LoginSubmit)
+	mux.Handle("POST /login", rl(http.HandlerFunc(uiH.LoginSubmit)))
 	mux.HandleFunc("GET /register", uiH.RegisterPage)
-	mux.HandleFunc("POST /register", uiH.RegisterSubmit)
+	mux.Handle("POST /register", rl(http.HandlerFunc(uiH.RegisterSubmit)))
 	mux.Handle("/static/", http.FileServer(http.FS(uiHandler.StaticFS)))
 
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
@@ -45,5 +52,8 @@ func newHandler(deps *dependencies) http.Handler {
 		fmt.Fprintln(w, `{"status":"ok"}`)
 	})
 
-	return middleware.Logger(mux)
+	handler := middleware.SecurityHeaders(mux)
+	handler = middleware.MaxBytes(maxRequestBodyBytes)(handler)
+	handler = middleware.Logger(handler)
+	return handler, nil
 }

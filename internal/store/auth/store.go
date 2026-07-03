@@ -1,6 +1,9 @@
 package auth
 
-import "errors"
+import (
+	"context"
+	"errors"
+)
 
 var (
 	ErrDuplicate = errors.New("user already exists")
@@ -13,7 +16,7 @@ type UserRecord struct {
 }
 
 type Store interface {
-	CreateUser(email, hashedPassword string) error
-	GetUser(email string) (UserRecord, error)
-	ValidateRedirectURI(redirectURI string) error
+	CreateUser(ctx context.Context, email, hashedPassword string) error
+	GetUser(ctx context.Context, email string) (UserRecord, error)
+	ValidateRedirectURI(ctx context.Context, redirectURI string) error
 }

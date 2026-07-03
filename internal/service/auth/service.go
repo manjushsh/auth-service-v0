@@ -6,7 +6,10 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log"
+	"net/mail"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -21,7 +24,23 @@ const (
 	tokenTTL         = time.Hour
 	maxLoginAttempts = 5
 	lockoutDuration  = 15 * time.Minute
+	minPasswordLen   = 8
+	// bcrypt silently truncates/errors past 72 bytes; reject before hashing.
+	maxPasswordLen = 72
+	tokenIssuer    = "auth-service"
 )
+
+// dummyHash is compared against on unknown-user login attempts so that the
+// GenerateCode response time doesn't reveal whether an email is registered.
+var dummyHash = mustHash("not-a-real-password-used-for-timing-safety")
+
+func mustHash(pw string) []byte {
+	h, err := bcrypt.GenerateFromPassword([]byte(pw), bcrypt.DefaultCost)
+	if err != nil {
+		panic(err)
+	}
+	return h
+}
 
 var (
 	ErrInvalidCredentials = errors.New("invalid credentials")
@@ -40,13 +59,39 @@ type Service struct {
 	jwtSecret []byte
 }
 
-func New(s store.Store, cs codeStore, bl blocklist, lk locker, jwtSecret []byte) *Service {
-	return &Service{store: s, codeStore: cs, blocklist: bl, locker: lk, jwtSecret: jwtSecret}
+// minJWTSecretLen is enforced so a trivially short secret can't be brute-forced.
+const minJWTSecretLen = 32
+
+func New(s store.Store, cs codeStore, bl blocklist, lk locker, jwtSecret []byte) (*Service, error) {
+	if len(jwtSecret) < minJWTSecretLen {
+		return nil, fmt.Errorf("jwt secret must be at least %d bytes", minJWTSecretLen)
+	}
+	return &Service{store: s, codeStore: cs, blocklist: bl, locker: lk, jwtSecret: jwtSecret}, nil
 }
 
-func (s *Service) Register(req model.RegisterRequest) error {
-	if req.Email == "" || req.Password == "" {
+// normalizeEmail trims whitespace and lowercases so that the same address
+// can't be registered/locked-out under multiple case variants.
+func normalizeEmail(email string) string {
+	return strings.ToLower(strings.TrimSpace(email))
+}
+
+func validateCredentials(email, password string) error {
+	if email == "" || password == "" {
 		return ErrBadRequest
+	}
+	if _, err := mail.ParseAddress(email); err != nil {
+		return ErrBadRequest
+	}
+	if len(password) < minPasswordLen || len(password) > maxPasswordLen {
+		return ErrBadRequest
+	}
+	return nil
+}
+
+func (s *Service) Register(ctx context.Context, req model.RegisterRequest) error {
+	email := normalizeEmail(req.Email)
+	if err := validateCredentials(email, req.Password); err != nil {
+		return err
 	}
 
 	hashed, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
@@ -54,7 +99,7 @@ func (s *Service) Register(req model.RegisterRequest) error {
 		return err
 	}
 
-	if err := s.store.CreateUser(req.Email, string(hashed)); err != nil {
+	if err := s.store.CreateUser(ctx, email, string(hashed)); err != nil {
 		if errors.Is(err, store.ErrDuplicate) {
 			return ErrBadRequest
 		}
@@ -64,11 +109,18 @@ func (s *Service) Register(req model.RegisterRequest) error {
 }
 
 func (s *Service) GenerateCode(ctx context.Context, req model.GenerateCodeRequest) (model.GenerateCodeResponse, error) {
-	if req.Email == "" || req.Password == "" {
+	email := normalizeEmail(req.Email)
+	if email == "" || req.Password == "" {
 		return model.GenerateCodeResponse{}, ErrBadRequest
 	}
 
-	locked, err := s.locker.IsLocked(ctx, req.Email)
+	if req.RedirectURI != "" {
+		if err := s.ValidateRedirectURI(ctx, req.RedirectURI); err != nil {
+			return model.GenerateCodeResponse{}, err
+		}
+	}
+
+	locked, err := s.locker.IsLocked(ctx, email)
 	if err != nil {
 		return model.GenerateCodeResponse{}, err
 	}
@@ -76,19 +128,24 @@ func (s *Service) GenerateCode(ctx context.Context, req model.GenerateCodeReques
 		return model.GenerateCodeResponse{}, ErrAccountLocked
 	}
 
-	u, err := s.store.GetUser(req.Email)
+	u, err := s.store.GetUser(ctx, email)
 	if err != nil {
-		s.recordFailedAttempt(ctx, req.Email)
+		// Compare against a dummy hash so lookup-miss and bad-password paths
+		// take a similar amount of time (timing-based user enumeration).
+		bcrypt.CompareHashAndPassword(dummyHash, []byte(req.Password))
+		s.recordFailedAttempt(ctx, email)
 		return model.GenerateCodeResponse{}, ErrInvalidCredentials
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(req.Password)); err != nil {
-		s.recordFailedAttempt(ctx, req.Email)
+		s.recordFailedAttempt(ctx, email)
 		return model.GenerateCodeResponse{}, ErrInvalidCredentials
 	}
 
-	// Successful login — clear any previous failed attempts.
-	s.locker.ClearFailedAttempts(ctx, req.Email)
+	// Successful login, clear any previous failed attempts.
+	if err := s.locker.ClearFailedAttempts(ctx, email); err != nil {
+		log.Printf("auth: clear failed attempts for %s: %v", email, err)
+	}
 
 	code, err := randomString()
 	if err != nil {
@@ -131,6 +188,8 @@ func (s *Service) ExchangeCode(ctx context.Context, req model.ExchangeTokenReque
 	claims := jwt.RegisteredClaims{
 		ID:        jti,
 		Subject:   userID,
+		Issuer:    tokenIssuer,
+		Audience:  jwt.ClaimStrings{tokenIssuer},
 		IssuedAt:  jwt.NewNumericDate(now),
 		ExpiresAt: jwt.NewNumericDate(now.Add(tokenTTL)),
 	}
@@ -188,7 +247,11 @@ func (s *Service) parseToken(tokenString string) (*jwt.RegisteredClaims, error) 
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 		}
 		return s.jwtSecret, nil
-	})
+	},
+		jwt.WithExpirationRequired(),
+		jwt.WithIssuer(tokenIssuer),
+		jwt.WithAudience(tokenIssuer),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -200,8 +263,8 @@ func (s *Service) parseToken(tokenString string) (*jwt.RegisteredClaims, error) 
 	return claims, nil
 }
 
-func (s *Service) ValidateRedirectURI(redirectURI string) error {
-	if err := s.store.ValidateRedirectURI(redirectURI); err != nil {
+func (s *Service) ValidateRedirectURI(ctx context.Context, redirectURI string) error {
+	if err := s.store.ValidateRedirectURI(ctx, redirectURI); err != nil {
 		return ErrUnauthorizedClient
 	}
 	return nil
@@ -211,10 +274,13 @@ func (s *Service) ValidateRedirectURI(redirectURI string) error {
 func (s *Service) recordFailedAttempt(ctx context.Context, email string) {
 	attempts, err := s.locker.RecordFailedAttempt(ctx, email, lockoutDuration)
 	if err != nil {
+		log.Printf("auth: record failed attempt for %s: %v", email, err)
 		return
 	}
 	if attempts >= maxLoginAttempts {
-		s.locker.LockAccount(ctx, email, lockoutDuration)
+		if err := s.locker.LockAccount(ctx, email, lockoutDuration); err != nil {
+			log.Printf("auth: lock account %s: %v", email, err)
+		}
 	}
 }
 
