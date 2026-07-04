@@ -13,26 +13,27 @@ import (
 	redisStore "github.com/manjushsh/auth-service/internal/store/redis"
 )
 
-const maxRequestBodyBytes = 1 << 20 // 1 MiB
+// https://go101.org/article/operators.html
+const maxRequestBodyBytes = 1 << 20 // Bit Shift 1 by 20 bits to get 1 MiB.
 
 func newHandler(deps *dependencies) (http.Handler, error) {
 	mux := http.NewServeMux()
 
-	cs := redisStore.NewRedisStore(deps.redis)
-	authSvc, err := authService.New(authStore.NewPostgresStore(deps.db), cs, cs, cs, deps.jwtSecret)
+	rs := redisStore.NewRedisStore(deps.redis)
+	authSvc, err := authService.New(authStore.NewPostgresStore(deps.db), rs, rs, rs, deps.jwtSecret)
 	if err != nil {
 		return nil, err
 	}
 
 	// Rate limiter: 10 requests per minute per IP per endpoint.
-	rl := middleware.RateLimit(cs, 10, time.Minute)
+	rl := middleware.RateLimit(rs, 10, time.Minute)
 	// Token exchange is guessable-secret sensitive; keep it tighter.
-	rlToken := middleware.RateLimit(cs, 30, time.Minute)
+	rlToken := middleware.RateLimit(rs, 30, time.Minute)
 
 	// API handlers
 	authH := authHandler.New(authSvc)
 	mux.Handle("POST /api/auth/register", rl(http.HandlerFunc(authH.Register)))
-	// Login and code routes are same. Just kept for API so that won't get confused
+	// Login and code routes are same. Just kept for API so that won't get confused later
 	mux.Handle("POST /api/auth/login", rl(http.HandlerFunc(authH.GenerateCode)))
 	mux.Handle("POST /api/auth/code", rl(http.HandlerFunc(authH.GenerateCode)))
 	mux.Handle("POST /api/auth/token", rlToken(http.HandlerFunc(authH.ExchangeToken)))

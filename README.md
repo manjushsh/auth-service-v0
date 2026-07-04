@@ -39,6 +39,13 @@ docker compose up --build -d
 docker compose logs -f app
 ```
 
+If want to run server on host, while still using Docker for the database and Redis, set `SERVER_PORT` to a port on your host machine and `INSECURE_COOKIES` to `true`.
+then still start docker with services and then run
+
+```bash
+go run ./cmd/server/
+```
+
 This uses the `dev` build target (`docker-compose.yml`'s `app.build.target`), which runs Air — it watches for `.go` file changes and rebuilds automatically inside the container via the bind-mounted source.
 
 `INSECURE_COOKIES=true` in `.env.example` disables the `Secure` flag on the CSRF cookie so the hosted login/register pages work over plain HTTP locally. Leave it unset/`false` in any environment served over HTTPS.

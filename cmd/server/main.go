@@ -24,17 +24,13 @@ type dependencies struct {
 }
 
 func main() {
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		log.Fatal("DATABASE_URL is not set")
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	jwtSecret := os.Getenv("JWT_SECRET")
-	if jwtSecret == "" {
-		log.Fatal("JWT_SECRET is not set")
-	}
-
-	database, err := db.Open(dsn)
+	// Connect to the database
+	database, err := db.Open(cfg.databaseURL)
 	if err != nil {
 		log.Fatalf("connect to db: %v", err)
 	}
@@ -46,11 +42,8 @@ func main() {
 	}
 	log.Println("migrations applied")
 
-	redisURL := os.Getenv("REDIS_URL")
-	if redisURL == "" {
-		redisURL = "redis://localhost:6379"
-	}
-	redisOpts, err := redis.ParseURL(redisURL)
+	// Connect to redis
+	redisOpts, err := redis.ParseURL(cfg.redisURL)
 	if err != nil {
 		log.Fatalf("parse redis url: %v", err)
 	}
@@ -61,20 +54,18 @@ func main() {
 	defer redisClient.Close()
 	log.Println("connected to redis")
 
-	insecureCookies := os.Getenv("INSECURE_COOKIES") == "true"
-
 	handler, err := newHandler(&dependencies{
 		db:            database,
 		redis:         redisClient,
-		jwtSecret:     []byte(jwtSecret),
-		secureCookies: !insecureCookies,
+		jwtSecret:     []byte(cfg.jwtSecret),
+		secureCookies: !cfg.insecureCookies,
 	})
 	if err != nil {
 		log.Fatalf("build handler: %v", err)
 	}
 
 	srv := &http.Server{
-		Addr:         ":8080",
+		Addr:         ":" + cfg.port,
 		Handler:      handler,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
