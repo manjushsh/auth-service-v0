@@ -26,6 +26,9 @@ type GenerateCodeResponse struct {
 
 type ExchangeTokenRequest struct {
 	Code string `json:"code"`
+	// RedirectURI must match the redirect_uri the code was issued for
+	// (empty when the code was issued without one).
+	RedirectURI string `json:"redirect_uri"`
 }
 
 type ExchangeTokenResponse struct {

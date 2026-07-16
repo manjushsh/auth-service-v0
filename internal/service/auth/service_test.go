@@ -8,35 +8,42 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
+
 	model "github.com/manjushsh/auth-service/internal/model/auth"
 	store "github.com/manjushsh/auth-service/internal/store/auth"
 )
 
 // --- fakes for the narrow interfaces in deps.go ---
 
-type fakeCodeStore struct {
-	mu    sync.Mutex
-	codes map[string]string
+type fakeCode struct {
+	userID      string
+	redirectURI string
 }
 
-func newFakeCodeStore() *fakeCodeStore { return &fakeCodeStore{codes: map[string]string{}} }
+type fakeCodeStore struct {
+	mu    sync.Mutex
+	codes map[string]fakeCode
+}
 
-func (f *fakeCodeStore) StoreCode(ctx context.Context, code, userID string, ttl time.Duration) error {
+func newFakeCodeStore() *fakeCodeStore { return &fakeCodeStore{codes: map[string]fakeCode{}} }
+
+func (f *fakeCodeStore) StoreCode(ctx context.Context, code, userID, redirectURI string, ttl time.Duration) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.codes[code] = userID
+	f.codes[code] = fakeCode{userID: userID, redirectURI: redirectURI}
 	return nil
 }
 
-func (f *fakeCodeStore) RedeemCode(ctx context.Context, code string) (string, error) {
+func (f *fakeCodeStore) RedeemCode(ctx context.Context, code string) (string, string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	userID, ok := f.codes[code]
+	c, ok := f.codes[code]
 	if !ok {
-		return "", errors.New("code not found")
+		return "", "", errors.New("code not found")
 	}
 	delete(f.codes, code)
-	return userID, nil
+	return c.userID, c.redirectURI, nil
 }
 
 type fakeBlocklist struct {
@@ -100,7 +107,9 @@ func newTestService(t *testing.T, allowedRedirects ...string) (*Service, *store.
 	t.Helper()
 	st := store.NewMemoryStore(allowedRedirects...)
 	secret := []byte(strings.Repeat("s", minJWTSecretLen))
-	svc, err := New(st, newFakeCodeStore(), newFakeBlocklist(), newFakeLocker(), secret)
+	// MinCost keeps the bcrypt-heavy tests fast.
+	cfg := Config{BcryptCost: bcrypt.MinCost}
+	svc, err := New(st, newFakeCodeStore(), newFakeBlocklist(), newFakeLocker(), secret, cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -111,9 +120,18 @@ const testPassword = "correct-horse-battery-staple"
 
 func TestNew_RejectsShortSecret(t *testing.T) {
 	st := store.NewMemoryStore()
-	_, err := New(st, newFakeCodeStore(), newFakeBlocklist(), newFakeLocker(), []byte("too-short"))
+	_, err := New(st, newFakeCodeStore(), newFakeBlocklist(), newFakeLocker(), []byte("too-short"), Config{})
 	if err == nil {
 		t.Fatal("expected error for short jwt secret")
+	}
+}
+
+func TestNew_RejectsOutOfRangeBcryptCost(t *testing.T) {
+	st := store.NewMemoryStore()
+	secret := []byte(strings.Repeat("s", minJWTSecretLen))
+	_, err := New(st, newFakeCodeStore(), newFakeBlocklist(), newFakeLocker(), secret, Config{BcryptCost: bcrypt.MaxCost + 1})
+	if err == nil {
+		t.Fatal("expected error for out-of-range bcrypt cost")
 	}
 }
 
@@ -188,7 +206,7 @@ func TestGenerateCode_WrongPasswordLocksAccountAfterThreshold(t *testing.T) {
 		t.Fatalf("Register: %v", err)
 	}
 
-	for i := 0; i < maxLoginAttempts; i++ {
+	for i := 0; i < DefaultMaxLoginAttempts; i++ {
 		_, err := svc.GenerateCode(ctx, model.GenerateCodeRequest{
 			Credentials: model.Credentials{Email: email, Password: "wrong-password"},
 		})
@@ -201,7 +219,7 @@ func TestGenerateCode_WrongPasswordLocksAccountAfterThreshold(t *testing.T) {
 		Credentials: model.Credentials{Email: email, Password: testPassword},
 	})
 	if !errors.Is(err, ErrAccountLocked) {
-		t.Fatalf("got %v, want ErrAccountLocked after %d failed attempts", err, maxLoginAttempts)
+		t.Fatalf("got %v, want ErrAccountLocked after %d failed attempts", err, DefaultMaxLoginAttempts)
 	}
 }
 
@@ -255,6 +273,59 @@ func TestExchangeCode_SingleUse(t *testing.T) {
 	// Redeeming the same code again must fail.
 	if _, err := svc.ExchangeCode(ctx, model.ExchangeTokenRequest{Code: gen.Code}); !errors.Is(err, ErrInvalidCode) {
 		t.Fatalf("second exchange: got %v, want ErrInvalidCode", err)
+	}
+}
+
+func TestExchangeCode_BoundToRedirectURI(t *testing.T) {
+	const redirect = "https://app.example.com/callback"
+	svc, _ := newTestService(t, redirect)
+	ctx := context.Background()
+	email := "user@example.com"
+	if err := svc.Register(ctx, model.RegisterRequest{Credentials: model.Credentials{Email: email, Password: testPassword}}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	newCode := func() string {
+		t.Helper()
+		gen, err := svc.GenerateCode(ctx, model.GenerateCodeRequest{
+			Credentials: model.Credentials{Email: email, Password: testPassword},
+			RedirectURI: redirect,
+		})
+		if err != nil {
+			t.Fatalf("GenerateCode: %v", err)
+		}
+		return gen.Code
+	}
+
+	// Missing redirect_uri at exchange must fail.
+	if _, err := svc.ExchangeCode(ctx, model.ExchangeTokenRequest{Code: newCode()}); !errors.Is(err, ErrInvalidCode) {
+		t.Fatalf("exchange without redirect_uri: got %v, want ErrInvalidCode", err)
+	}
+
+	// Wrong redirect_uri at exchange must fail.
+	if _, err := svc.ExchangeCode(ctx, model.ExchangeTokenRequest{
+		Code:        newCode(),
+		RedirectURI: "https://evil.example.com/steal",
+	}); !errors.Is(err, ErrInvalidCode) {
+		t.Fatalf("exchange with wrong redirect_uri: got %v, want ErrInvalidCode", err)
+	}
+
+	// A failed exchange must burn the code.
+	code := newCode()
+	if _, err := svc.ExchangeCode(ctx, model.ExchangeTokenRequest{Code: code}); !errors.Is(err, ErrInvalidCode) {
+		t.Fatalf("mismatched exchange: got %v, want ErrInvalidCode", err)
+	}
+	if _, err := svc.ExchangeCode(ctx, model.ExchangeTokenRequest{Code: code, RedirectURI: redirect}); !errors.Is(err, ErrInvalidCode) {
+		t.Fatalf("retry after failed exchange: got %v, want ErrInvalidCode (code burned)", err)
+	}
+
+	// Matching redirect_uri succeeds.
+	tok, err := svc.ExchangeCode(ctx, model.ExchangeTokenRequest{Code: newCode(), RedirectURI: redirect})
+	if err != nil {
+		t.Fatalf("exchange with matching redirect_uri: %v", err)
+	}
+	if tok.Token == "" {
+		t.Fatal("expected non-empty token")
 	}
 }
 

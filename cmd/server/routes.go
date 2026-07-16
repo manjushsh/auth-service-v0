@@ -20,15 +20,15 @@ func newHandler(deps *dependencies) (http.Handler, error) {
 	mux := http.NewServeMux()
 
 	rs := redisStore.NewRedisStore(deps.redis)
-	authSvc, err := authService.New(authStore.NewPostgresStore(deps.db), rs, rs, rs, deps.jwtSecret)
+	authSvc, err := authService.New(authStore.NewPostgresStore(deps.db), rs, rs, rs, []byte(deps.cfg.jwtSecret), deps.cfg.auth)
 	if err != nil {
 		return nil, err
 	}
 
-	// Rate limiter: 10 requests per minute per IP per endpoint.
-	rl := middleware.RateLimit(rs, 10, time.Minute)
-	// Token exchange is guessable-secret sensitive; keep it tighter.
-	rlToken := middleware.RateLimit(rs, 30, time.Minute)
+	// Rate limiters: requests per minute per IP per endpoint. The credential
+	// routes get the tighter limit; token exchange allows more.
+	rl := middleware.RateLimit(rs, deps.cfg.rateLimitPerMin, time.Minute)
+	rlToken := middleware.RateLimit(rs, deps.cfg.rateLimitTokenPerMin, time.Minute)
 
 	// API handlers
 	authH := authHandler.New(authSvc)
@@ -41,7 +41,7 @@ func newHandler(deps *dependencies) (http.Handler, error) {
 	mux.Handle("POST /api/auth/introspect", rlToken(http.HandlerFunc(authH.Introspect)))
 
 	// UI handlers
-	uiH := uiHandler.New(authSvc, deps.secureCookies)
+	uiH := uiHandler.New(authSvc, !deps.cfg.insecureCookies)
 	mux.HandleFunc("GET /login", uiH.LoginPage)
 	mux.Handle("POST /login", rl(http.HandlerFunc(uiH.LoginSubmit)))
 	mux.HandleFunc("GET /register", uiH.RegisterPage)

@@ -17,10 +17,9 @@ import (
 )
 
 type dependencies struct {
-	db            *sql.DB
-	redis         *redis.Client
-	jwtSecret     []byte
-	secureCookies bool
+	db    *sql.DB
+	redis *redis.Client
+	cfg   config
 }
 
 func main() {
@@ -48,17 +47,18 @@ func main() {
 		log.Fatalf("parse redis url: %v", err)
 	}
 	redisClient := redis.NewClient(redisOpts)
-	if err := redisClient.Ping(context.Background()).Err(); err != nil {
+	pingCtx, cancelPing := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := redisClient.Ping(pingCtx).Err(); err != nil {
 		log.Fatalf("connect to redis: %v", err)
 	}
+	cancelPing()
 	defer redisClient.Close()
 	log.Println("connected to redis")
 
 	handler, err := newHandler(&dependencies{
-		db:            database,
-		redis:         redisClient,
-		jwtSecret:     []byte(cfg.jwtSecret),
-		secureCookies: !cfg.insecureCookies,
+		db:    database,
+		redis: redisClient,
+		cfg:   cfg,
 	})
 	if err != nil {
 		log.Fatalf("build handler: %v", err)

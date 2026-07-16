@@ -20,26 +20,48 @@ import (
 )
 
 const (
-	codeTTL          = 60 * time.Second
-	tokenTTL         = time.Hour
-	maxLoginAttempts = 5
-	lockoutDuration  = 15 * time.Minute
-	minPasswordLen   = 8
+	minPasswordLen = 8
 	// bcrypt silently truncates/errors past 72 bytes; reject before hashing.
 	maxPasswordLen = 72
 	tokenIssuer    = "auth-service"
 )
 
-// dummyHash is compared against on unknown-user login attempts so that the
-// GenerateCode response time doesn't reveal whether an email is registered.
-var dummyHash = mustHash("not-a-real-password-used-for-timing-safety")
+// Defaults for the tunables in Config; a zero Config gets all of these.
+const (
+	DefaultCodeTTL          = 60 * time.Second
+	DefaultTokenTTL         = time.Hour
+	DefaultMaxLoginAttempts = 5
+	DefaultLockoutDuration  = 15 * time.Minute
+	DefaultBcryptCost       = bcrypt.DefaultCost
+)
 
-func mustHash(pw string) []byte {
-	h, err := bcrypt.GenerateFromPassword([]byte(pw), bcrypt.DefaultCost)
-	if err != nil {
-		panic(err)
+// Config holds the tunable knobs of the service. Zero values fall back to
+// the Default* constants, so Config{} is a valid production configuration.
+type Config struct {
+	CodeTTL          time.Duration // lifetime of a one-time login code
+	TokenTTL         time.Duration // lifetime of an issued JWT
+	MaxLoginAttempts int           // failed logins before the account locks
+	LockoutDuration  time.Duration // how long a locked account stays locked
+	BcryptCost       int           // bcrypt cost used when hashing passwords
+}
+
+func (c Config) withDefaults() Config {
+	if c.CodeTTL <= 0 {
+		c.CodeTTL = DefaultCodeTTL
 	}
-	return h
+	if c.TokenTTL <= 0 {
+		c.TokenTTL = DefaultTokenTTL
+	}
+	if c.MaxLoginAttempts <= 0 {
+		c.MaxLoginAttempts = DefaultMaxLoginAttempts
+	}
+	if c.LockoutDuration <= 0 {
+		c.LockoutDuration = DefaultLockoutDuration
+	}
+	if c.BcryptCost <= 0 {
+		c.BcryptCost = DefaultBcryptCost
+	}
+	return c
 }
 
 var (
@@ -57,16 +79,37 @@ type Service struct {
 	blocklist blocklist
 	locker    locker
 	jwtSecret []byte
+	cfg       Config
+	// dummyHash is compared against on unknown-user login attempts so that the
+	// GenerateCode response time doesn't reveal whether an email is registered.
+	// It is hashed at cfg.BcryptCost so both paths cost the same.
+	dummyHash []byte
 }
 
 // minJWTSecretLen is enforced so a trivially short secret can't be brute-forced.
 const minJWTSecretLen = 32
 
-func New(s store.Store, cs codeStore, bl blocklist, lk locker, jwtSecret []byte) (*Service, error) {
+func New(s store.Store, cs codeStore, bl blocklist, lk locker, jwtSecret []byte, cfg Config) (*Service, error) {
 	if len(jwtSecret) < minJWTSecretLen {
 		return nil, fmt.Errorf("jwt secret must be at least %d bytes", minJWTSecretLen)
 	}
-	return &Service{store: s, codeStore: cs, blocklist: bl, locker: lk, jwtSecret: jwtSecret}, nil
+	cfg = cfg.withDefaults()
+	if cfg.BcryptCost < bcrypt.MinCost || cfg.BcryptCost > bcrypt.MaxCost {
+		return nil, fmt.Errorf("bcrypt cost must be between %d and %d", bcrypt.MinCost, bcrypt.MaxCost)
+	}
+	dummyHash, err := bcrypt.GenerateFromPassword([]byte("not-a-real-password-used-for-timing-safety"), cfg.BcryptCost)
+	if err != nil {
+		return nil, fmt.Errorf("generate dummy hash: %w", err)
+	}
+	return &Service{
+		store:     s,
+		codeStore: cs,
+		blocklist: bl,
+		locker:    lk,
+		jwtSecret: jwtSecret,
+		cfg:       cfg,
+		dummyHash: dummyHash,
+	}, nil
 }
 
 // normalizeEmail trims whitespace and lowercases so that the same address
@@ -94,7 +137,7 @@ func (s *Service) Register(ctx context.Context, req model.RegisterRequest) error
 		return err
 	}
 
-	hashed, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	hashed, err := bcrypt.GenerateFromPassword([]byte(req.Password), s.cfg.BcryptCost)
 	if err != nil {
 		return err
 	}
@@ -132,7 +175,7 @@ func (s *Service) GenerateCode(ctx context.Context, req model.GenerateCodeReques
 	if err != nil {
 		// Compare against a dummy hash so lookup-miss and bad-password paths
 		// take a similar amount of time (timing-based user enumeration).
-		bcrypt.CompareHashAndPassword(dummyHash, []byte(req.Password))
+		bcrypt.CompareHashAndPassword(s.dummyHash, []byte(req.Password))
 		s.recordFailedAttempt(ctx, email)
 		return model.GenerateCodeResponse{}, ErrInvalidCredentials
 	}
@@ -152,7 +195,9 @@ func (s *Service) GenerateCode(ctx context.Context, req model.GenerateCodeReques
 		return model.GenerateCodeResponse{}, err
 	}
 
-	if err := s.codeStore.StoreCode(ctx, code, u.ID, codeTTL); err != nil {
+	// Bind the code to the redirect_uri it was issued for so it can only be
+	// exchanged by the client that received it (see ExchangeCode).
+	if err := s.codeStore.StoreCode(ctx, code, u.ID, req.RedirectURI, s.cfg.CodeTTL); err != nil {
 		return model.GenerateCodeResponse{}, err
 	}
 
@@ -174,8 +219,16 @@ func (s *Service) ExchangeCode(ctx context.Context, req model.ExchangeTokenReque
 		return model.ExchangeTokenResponse{}, ErrBadRequest
 	}
 
-	userID, err := s.codeStore.RedeemCode(ctx, req.Code)
+	userID, redirectURI, err := s.codeStore.RedeemCode(ctx, req.Code)
 	if err != nil {
+		return model.ExchangeTokenResponse{}, ErrInvalidCode
+	}
+
+	// The code is bound to the redirect_uri it was issued for; a stolen code
+	// can't be exchanged without also knowing it. RedeemCode has already
+	// consumed the code, so a mismatched attempt burns it (OAuth requires
+	// invalidating a code on a failed exchange).
+	if redirectURI != req.RedirectURI {
 		return model.ExchangeTokenResponse{}, ErrInvalidCode
 	}
 
@@ -191,7 +244,7 @@ func (s *Service) ExchangeCode(ctx context.Context, req model.ExchangeTokenReque
 		Issuer:    tokenIssuer,
 		Audience:  jwt.ClaimStrings{tokenIssuer},
 		IssuedAt:  jwt.NewNumericDate(now),
-		ExpiresAt: jwt.NewNumericDate(now.Add(tokenTTL)),
+		ExpiresAt: jwt.NewNumericDate(now.Add(s.cfg.TokenTTL)),
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
@@ -202,7 +255,7 @@ func (s *Service) ExchangeCode(ctx context.Context, req model.ExchangeTokenReque
 
 	return model.ExchangeTokenResponse{
 		Token:     signed,
-		ExpiresIn: int(tokenTTL.Seconds()),
+		ExpiresIn: int(s.cfg.TokenTTL.Seconds()),
 	}, nil
 }
 
@@ -272,13 +325,13 @@ func (s *Service) ValidateRedirectURI(ctx context.Context, redirectURI string) e
 
 // recordFailedAttempt increments the failure counter and locks the account on threshold.
 func (s *Service) recordFailedAttempt(ctx context.Context, email string) {
-	attempts, err := s.locker.RecordFailedAttempt(ctx, email, lockoutDuration)
+	attempts, err := s.locker.RecordFailedAttempt(ctx, email, s.cfg.LockoutDuration)
 	if err != nil {
 		log.Printf("auth: record failed attempt for %s: %v", email, err)
 		return
 	}
-	if attempts >= maxLoginAttempts {
-		if err := s.locker.LockAccount(ctx, email, lockoutDuration); err != nil {
+	if attempts >= s.cfg.MaxLoginAttempts {
+		if err := s.locker.LockAccount(ctx, email, s.cfg.LockoutDuration); err != nil {
 			log.Printf("auth: lock account %s: %v", email, err)
 		}
 	}

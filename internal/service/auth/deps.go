@@ -6,8 +6,8 @@ import (
 )
 
 type codeStore interface {
-	StoreCode(ctx context.Context, code, userID string, ttl time.Duration) error
-	RedeemCode(ctx context.Context, code string) (string, error)
+	StoreCode(ctx context.Context, code, userID, redirectURI string, ttl time.Duration) error
+	RedeemCode(ctx context.Context, code string) (userID, redirectURI string, err error)
 }
 
 type blocklist interface {

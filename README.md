@@ -16,7 +16,7 @@ You need to extract one time code and get JWT with API call in your service.
 | POST | `/api/auth/register` | Register a new user |
 | POST | `/api/auth/login` | Verify credentials, get a one-time code (alias of `/api/auth/code`) |
 | POST | `/api/auth/code` | Same as `/api/auth/login` |
-| POST | `/api/auth/token` | Exchange a one-time code for a JWT |
+| POST | `/api/auth/token` | Exchange a one-time code for a JWT (must send the same `redirect_uri` the code was issued with, if any) |
 | POST | `/api/auth/logout` | Revoke a JWT (`Authorization: Bearer <token>`) |
 | POST | `/api/auth/introspect` | Check whether a JWT is active (`Authorization: Bearer <token>`) |
 | GET/POST | `/login` | Hosted login page/form (`redirect_uri` must belong to a registered client) |
@@ -28,7 +28,7 @@ All `POST` routes above are rate limited per IP; `/api/auth/token`, `/logout` an
 
 1. `POST /api/auth/register` — create a user.
 2. `POST /api/auth/login` (or `/code`) with `email`/`password` (+ optional `redirect_uri` belonging to a registered client) — returns a short-lived one-time `code`.
-3. `POST /api/auth/token` with that `code` — returns a JWT (`expires_in` seconds).
+3. `POST /api/auth/token` with that `code` (and the same `redirect_uri` if one was used in step 2 — codes are bound to the redirect URI they were issued for, and a mismatched exchange invalidates the code) — returns a JWT (`expires_in` seconds).
 4. Use the JWT as a bearer token; `POST /api/auth/introspect` to validate it, `POST /api/auth/logout` to revoke it early.
 
 ## Local dev
