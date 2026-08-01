@@ -8,6 +8,8 @@ You need to extract one time code and get JWT with API call in your service.
 2. Can't think any other feature as of now.. will add later
 
 
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a detailed architecture reference (request/data flow diagrams, Redis key space, full config reference, security posture, extension points).
+
 ## API
 
 | Method | Path | Description |
