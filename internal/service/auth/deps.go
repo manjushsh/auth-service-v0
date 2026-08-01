@@ -1,0 +1,23 @@
+package auth
+
+import (
+	"context"
+	"time"
+)
+
+type codeStore interface {
+	StoreCode(ctx context.Context, code, userID, redirectURI string, ttl time.Duration) error
+	RedeemCode(ctx context.Context, code string) (userID, redirectURI string, err error)
+}
+
+type blocklist interface {
+	Revoke(ctx context.Context, jti string, ttl time.Duration) error
+	IsRevoked(ctx context.Context, jti string) (bool, error)
+}
+
+type locker interface {
+	IsLocked(ctx context.Context, email string) (bool, error)
+	RecordFailedAttempt(ctx context.Context, email string, ttl time.Duration) (int, error)
+	LockAccount(ctx context.Context, email string, ttl time.Duration) error
+	ClearFailedAttempts(ctx context.Context, email string) error
+}

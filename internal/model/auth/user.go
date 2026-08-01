@@ -5,11 +5,6 @@ type Credentials struct {
 	Password string `json:"password"`
 }
 
-type UserRecord struct {
-	ID           string
-	PasswordHash string
-}
-
 type RegisterRequest struct {
 	Credentials
 }
@@ -31,15 +26,14 @@ type GenerateCodeResponse struct {
 
 type ExchangeTokenRequest struct {
 	Code string `json:"code"`
+	// RedirectURI must match the redirect_uri the code was issued for
+	// (empty when the code was issued without one).
+	RedirectURI string `json:"redirect_uri"`
 }
 
 type ExchangeTokenResponse struct {
 	Token     string `json:"token"`
 	ExpiresIn int    `json:"expires_in"`
-}
-
-type IntrospectRequest struct {
-	Token string `json:"token"`
 }
 
 type IntrospectResponse struct {

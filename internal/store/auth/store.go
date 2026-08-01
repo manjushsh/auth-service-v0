@@ -1,9 +1,8 @@
 package auth
 
 import (
+	"context"
 	"errors"
-
-	model "github.com/manjushsh/auth-service/internal/model/auth"
 )
 
 var (
@@ -11,8 +10,13 @@ var (
 	ErrNotFound  = errors.New("user not found")
 )
 
+type UserRecord struct {
+	ID           string
+	PasswordHash string
+}
+
 type Store interface {
-	CreateUser(email, hashedPassword string) error
-	GetUser(email string) (model.UserRecord, error)
-	ValidateRedirectURI(redirectURI string) error
+	CreateUser(ctx context.Context, email, hashedPassword string) error
+	GetUser(ctx context.Context, email string) (UserRecord, error)
+	ValidateRedirectURI(ctx context.Context, redirectURI string) error
 }

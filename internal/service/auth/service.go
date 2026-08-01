@@ -6,7 +6,10 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log"
+	"net/mail"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -14,13 +17,52 @@ import (
 
 	model "github.com/manjushsh/auth-service/internal/model/auth"
 	store "github.com/manjushsh/auth-service/internal/store/auth"
-	codeStore "github.com/manjushsh/auth-service/internal/store/code"
 )
 
 const (
-	codeTTL  = 60 * time.Second
-	tokenTTL = time.Hour
+	minPasswordLen = 8
+	// bcrypt silently truncates/errors past 72 bytes; reject before hashing.
+	maxPasswordLen = 72
+	tokenIssuer    = "auth-service"
 )
+
+// Defaults for the tunables in Config; a zero Config gets all of these.
+const (
+	DefaultCodeTTL          = 60 * time.Second
+	DefaultTokenTTL         = time.Hour
+	DefaultMaxLoginAttempts = 5
+	DefaultLockoutDuration  = 15 * time.Minute
+	DefaultBcryptCost       = bcrypt.DefaultCost
+)
+
+// Config holds the tunable knobs of the service. Zero values fall back to
+// the Default* constants, so Config{} is a valid production configuration.
+type Config struct {
+	CodeTTL          time.Duration // lifetime of a one-time login code
+	TokenTTL         time.Duration // lifetime of an issued JWT
+	MaxLoginAttempts int           // failed logins before the account locks
+	LockoutDuration  time.Duration // how long a locked account stays locked
+	BcryptCost       int           // bcrypt cost used when hashing passwords
+}
+
+func (c Config) withDefaults() Config {
+	if c.CodeTTL <= 0 {
+		c.CodeTTL = DefaultCodeTTL
+	}
+	if c.TokenTTL <= 0 {
+		c.TokenTTL = DefaultTokenTTL
+	}
+	if c.MaxLoginAttempts <= 0 {
+		c.MaxLoginAttempts = DefaultMaxLoginAttempts
+	}
+	if c.LockoutDuration <= 0 {
+		c.LockoutDuration = DefaultLockoutDuration
+	}
+	if c.BcryptCost <= 0 {
+		c.BcryptCost = DefaultBcryptCost
+	}
+	return c
+}
 
 var (
 	ErrInvalidCredentials = errors.New("invalid credentials")
@@ -28,30 +70,79 @@ var (
 	ErrInvalidCode        = errors.New("invalid or expired code")
 	ErrInvalidToken       = errors.New("invalid token")
 	ErrUnauthorizedClient = errors.New("unauthorized redirect URI")
+	ErrAccountLocked      = errors.New("account locked due to too many failed attempts")
 )
 
 type Service struct {
 	store     store.Store
-	codeStore codeStore.Store
-	blocklist codeStore.Blocklist
+	codeStore codeStore
+	blocklist blocklist
+	locker    locker
 	jwtSecret []byte
+	cfg       Config
+	// dummyHash is compared against on unknown-user login attempts so that the
+	// GenerateCode response time doesn't reveal whether an email is registered.
+	// It is hashed at cfg.BcryptCost so both paths cost the same.
+	dummyHash []byte
 }
 
-func New(s store.Store, cs codeStore.Store, bl codeStore.Blocklist, jwtSecret []byte) *Service {
-	return &Service{store: s, codeStore: cs, blocklist: bl, jwtSecret: jwtSecret}
+// minJWTSecretLen is enforced so a trivially short secret can't be brute-forced.
+const minJWTSecretLen = 32
+
+func New(s store.Store, cs codeStore, bl blocklist, lk locker, jwtSecret []byte, cfg Config) (*Service, error) {
+	if len(jwtSecret) < minJWTSecretLen {
+		return nil, fmt.Errorf("jwt secret must be at least %d bytes", minJWTSecretLen)
+	}
+	cfg = cfg.withDefaults()
+	if cfg.BcryptCost < bcrypt.MinCost || cfg.BcryptCost > bcrypt.MaxCost {
+		return nil, fmt.Errorf("bcrypt cost must be between %d and %d", bcrypt.MinCost, bcrypt.MaxCost)
+	}
+	dummyHash, err := bcrypt.GenerateFromPassword([]byte("not-a-real-password-used-for-timing-safety"), cfg.BcryptCost)
+	if err != nil {
+		return nil, fmt.Errorf("generate dummy hash: %w", err)
+	}
+	return &Service{
+		store:     s,
+		codeStore: cs,
+		blocklist: bl,
+		locker:    lk,
+		jwtSecret: jwtSecret,
+		cfg:       cfg,
+		dummyHash: dummyHash,
+	}, nil
 }
 
-func (s *Service) Register(req model.RegisterRequest) error {
-	if req.Email == "" || req.Password == "" {
+// normalizeEmail trims whitespace and lowercases so that the same address
+// can't be registered/locked-out under multiple case variants.
+func normalizeEmail(email string) string {
+	return strings.ToLower(strings.TrimSpace(email))
+}
+
+func validateCredentials(email, password string) error {
+	if email == "" || password == "" {
 		return ErrBadRequest
 	}
+	if _, err := mail.ParseAddress(email); err != nil {
+		return ErrBadRequest
+	}
+	if len(password) < minPasswordLen || len(password) > maxPasswordLen {
+		return ErrBadRequest
+	}
+	return nil
+}
 
-	hashed, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+func (s *Service) Register(ctx context.Context, req model.RegisterRequest) error {
+	email := normalizeEmail(req.Email)
+	if err := validateCredentials(email, req.Password); err != nil {
+		return err
+	}
+
+	hashed, err := bcrypt.GenerateFromPassword([]byte(req.Password), s.cfg.BcryptCost)
 	if err != nil {
 		return err
 	}
 
-	if err := s.store.CreateUser(req.Email, string(hashed)); err != nil {
+	if err := s.store.CreateUser(ctx, email, string(hashed)); err != nil {
 		if errors.Is(err, store.ErrDuplicate) {
 			return ErrBadRequest
 		}
@@ -61,17 +152,42 @@ func (s *Service) Register(req model.RegisterRequest) error {
 }
 
 func (s *Service) GenerateCode(ctx context.Context, req model.GenerateCodeRequest) (model.GenerateCodeResponse, error) {
-	if req.Email == "" || req.Password == "" {
+	email := normalizeEmail(req.Email)
+	if email == "" || req.Password == "" {
 		return model.GenerateCodeResponse{}, ErrBadRequest
 	}
 
-	u, err := s.store.GetUser(req.Email)
+	if req.RedirectURI != "" {
+		if err := s.ValidateRedirectURI(ctx, req.RedirectURI); err != nil {
+			return model.GenerateCodeResponse{}, err
+		}
+	}
+
+	locked, err := s.locker.IsLocked(ctx, email)
 	if err != nil {
+		return model.GenerateCodeResponse{}, err
+	}
+	if locked {
+		return model.GenerateCodeResponse{}, ErrAccountLocked
+	}
+
+	u, err := s.store.GetUser(ctx, email)
+	if err != nil {
+		// Compare against a dummy hash so lookup-miss and bad-password paths
+		// take a similar amount of time (timing-based user enumeration).
+		bcrypt.CompareHashAndPassword(s.dummyHash, []byte(req.Password))
+		s.recordFailedAttempt(ctx, email)
 		return model.GenerateCodeResponse{}, ErrInvalidCredentials
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(req.Password)); err != nil {
+		s.recordFailedAttempt(ctx, email)
 		return model.GenerateCodeResponse{}, ErrInvalidCredentials
+	}
+
+	// Successful login, clear any previous failed attempts.
+	if err := s.locker.ClearFailedAttempts(ctx, email); err != nil {
+		log.Printf("auth: clear failed attempts for %s: %v", email, err)
 	}
 
 	code, err := randomString()
@@ -79,7 +195,9 @@ func (s *Service) GenerateCode(ctx context.Context, req model.GenerateCodeReques
 		return model.GenerateCodeResponse{}, err
 	}
 
-	if err := s.codeStore.StoreCode(ctx, code, u.ID, codeTTL); err != nil {
+	// Bind the code to the redirect_uri it was issued for so it can only be
+	// exchanged by the client that received it (see ExchangeCode).
+	if err := s.codeStore.StoreCode(ctx, code, u.ID, req.RedirectURI, s.cfg.CodeTTL); err != nil {
 		return model.GenerateCodeResponse{}, err
 	}
 
@@ -101,8 +219,16 @@ func (s *Service) ExchangeCode(ctx context.Context, req model.ExchangeTokenReque
 		return model.ExchangeTokenResponse{}, ErrBadRequest
 	}
 
-	userID, err := s.codeStore.RedeemCode(ctx, req.Code)
+	userID, redirectURI, err := s.codeStore.RedeemCode(ctx, req.Code)
 	if err != nil {
+		return model.ExchangeTokenResponse{}, ErrInvalidCode
+	}
+
+	// The code is bound to the redirect_uri it was issued for; a stolen code
+	// can't be exchanged without also knowing it. RedeemCode has already
+	// consumed the code, so a mismatched attempt burns it (OAuth requires
+	// invalidating a code on a failed exchange).
+	if redirectURI != req.RedirectURI {
 		return model.ExchangeTokenResponse{}, ErrInvalidCode
 	}
 
@@ -115,8 +241,10 @@ func (s *Service) ExchangeCode(ctx context.Context, req model.ExchangeTokenReque
 	claims := jwt.RegisteredClaims{
 		ID:        jti,
 		Subject:   userID,
+		Issuer:    tokenIssuer,
+		Audience:  jwt.ClaimStrings{tokenIssuer},
 		IssuedAt:  jwt.NewNumericDate(now),
-		ExpiresAt: jwt.NewNumericDate(now.Add(tokenTTL)),
+		ExpiresAt: jwt.NewNumericDate(now.Add(s.cfg.TokenTTL)),
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
@@ -127,7 +255,7 @@ func (s *Service) ExchangeCode(ctx context.Context, req model.ExchangeTokenReque
 
 	return model.ExchangeTokenResponse{
 		Token:     signed,
-		ExpiresIn: int(tokenTTL.Seconds()),
+		ExpiresIn: int(s.cfg.TokenTTL.Seconds()),
 	}, nil
 }
 
@@ -172,7 +300,11 @@ func (s *Service) parseToken(tokenString string) (*jwt.RegisteredClaims, error) 
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 		}
 		return s.jwtSecret, nil
-	})
+	},
+		jwt.WithExpirationRequired(),
+		jwt.WithIssuer(tokenIssuer),
+		jwt.WithAudience(tokenIssuer),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -184,11 +316,25 @@ func (s *Service) parseToken(tokenString string) (*jwt.RegisteredClaims, error) 
 	return claims, nil
 }
 
-func (s *Service) ValidateRedirectURI(redirectURI string) error {
-	if err := s.store.ValidateRedirectURI(redirectURI); err != nil {
+func (s *Service) ValidateRedirectURI(ctx context.Context, redirectURI string) error {
+	if err := s.store.ValidateRedirectURI(ctx, redirectURI); err != nil {
 		return ErrUnauthorizedClient
 	}
 	return nil
+}
+
+// recordFailedAttempt increments the failure counter and locks the account on threshold.
+func (s *Service) recordFailedAttempt(ctx context.Context, email string) {
+	attempts, err := s.locker.RecordFailedAttempt(ctx, email, s.cfg.LockoutDuration)
+	if err != nil {
+		log.Printf("auth: record failed attempt for %s: %v", email, err)
+		return
+	}
+	if attempts >= s.cfg.MaxLoginAttempts {
+		if err := s.locker.LockAccount(ctx, email, s.cfg.LockoutDuration); err != nil {
+			log.Printf("auth: lock account %s: %v", email, err)
+		}
+	}
 }
 
 func randomString() (string, error) {
