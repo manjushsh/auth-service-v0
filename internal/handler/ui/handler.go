@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"crypto/rand"
 	"embed"
 	"encoding/hex"
@@ -34,23 +35,32 @@ type pageData struct {
 	Error       string
 }
 
-type Handler struct {
-	svc *svc.Service
+type service interface {
+	ValidateRedirectURI(ctx context.Context, redirectURI string) error
+	GenerateCode(ctx context.Context, req model.GenerateCodeRequest) (model.GenerateCodeResponse, error)
+	Register(ctx context.Context, req model.RegisterRequest) error
 }
 
-func New(s *svc.Service) *Handler {
-	return &Handler{svc: s}
+type Handler struct {
+	svc           service
+	secureCookies bool
+}
+
+// New builds a UI handler. secureCookies should be true in any deployment
+// served over HTTPS; set it false only for local plain-HTTP development.
+func New(s service, secureCookies bool) *Handler {
+	return &Handler{svc: s, secureCookies: secureCookies}
 }
 
 func (h *Handler) LoginPage(w http.ResponseWriter, r *http.Request) {
 	redirectURI := r.URL.Query().Get("redirect_uri")
 
-	if err := h.svc.ValidateRedirectURI(redirectURI); err != nil {
+	if err := h.svc.ValidateRedirectURI(r.Context(), redirectURI); err != nil {
 		http.Error(w, "invalid or missing redirect_uri", http.StatusBadRequest)
 		return
 	}
 
-	token, err := newCSRFToken(w)
+	token, err := h.newCSRFToken(w)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -71,7 +81,7 @@ func (h *Handler) LoginSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	redirectURI := r.FormValue("redirect_uri")
-	if err := h.svc.ValidateRedirectURI(redirectURI); err != nil {
+	if err := h.svc.ValidateRedirectURI(r.Context(), redirectURI); err != nil {
 		http.Error(w, "invalid redirect_uri", http.StatusBadRequest)
 		return
 	}
@@ -84,10 +94,20 @@ func (h *Handler) LoginSubmit(w http.ResponseWriter, r *http.Request) {
 		RedirectURI: redirectURI,
 	})
 	if err != nil {
-		token, _ := newCSRFToken(w)
+		token, _ := h.newCSRFToken(w)
 		msg := "invalid credentials"
-		if errors.Is(err, svc.ErrBadRequest) {
+		switch {
+		case errors.Is(err, svc.ErrBadRequest):
 			msg = "email and password are required"
+		case errors.Is(err, svc.ErrAccountLocked):
+			msg = "account locked due to too many failed attempts, try again later"
+		case errors.Is(err, svc.ErrInvalidCredentials):
+			msg = "invalid credentials"
+		case errors.Is(err, svc.ErrUnauthorizedClient):
+			msg = "invalid redirect_uri"
+		default:
+			log.Printf("LoginSubmit: %v", err)
+			msg = "something went wrong, please try again"
 		}
 		renderHTML(w, loginTmpl, pageData{RedirectURI: redirectURI, CSRFToken: token, Error: msg})
 		return
@@ -99,12 +119,12 @@ func (h *Handler) LoginSubmit(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) RegisterPage(w http.ResponseWriter, r *http.Request) {
 	redirectURI := r.URL.Query().Get("redirect_uri")
 
-	if err := h.svc.ValidateRedirectURI(redirectURI); err != nil {
+	if err := h.svc.ValidateRedirectURI(r.Context(), redirectURI); err != nil {
 		http.Error(w, "invalid or missing redirect_uri", http.StatusBadRequest)
 		return
 	}
 
-	token, err := newCSRFToken(w)
+	token, err := h.newCSRFToken(w)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -125,34 +145,34 @@ func (h *Handler) RegisterSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	redirectURI := r.FormValue("redirect_uri")
-	if err := h.svc.ValidateRedirectURI(redirectURI); err != nil {
+	if err := h.svc.ValidateRedirectURI(r.Context(), redirectURI); err != nil {
 		http.Error(w, "invalid redirect_uri", http.StatusBadRequest)
 		return
 	}
 
-	err := h.svc.Register(model.RegisterRequest{
+	err := h.svc.Register(r.Context(), model.RegisterRequest{
 		Credentials: model.Credentials{
 			Email:    r.FormValue("email"),
 			Password: r.FormValue("password"),
 		},
 	})
 	if err != nil {
-		token, _ := newCSRFToken(w)
+		token, _ := h.newCSRFToken(w)
 		msg := "registration failed"
 		if errors.Is(err, svc.ErrBadRequest) {
 			msg = "email already registered or invalid input"
+		} else {
+			log.Printf("RegisterSubmit: %v", err)
 		}
 		renderHTML(w, registerTmpl, pageData{RedirectURI: redirectURI, CSRFToken: token, Error: msg})
 		return
 	}
 
-	// Redirect to login so the user can get a code.....
 	loginURL := "/login?" + url.Values{"redirect_uri": {redirectURI}}.Encode()
 	http.Redirect(w, r, loginURL, http.StatusFound)
 }
 
-// newCSRFToken generates a random token, sets it as an HttpOnly cookie, and returns it for the form.
-func newCSRFToken(w http.ResponseWriter) (string, error) {
+func (h *Handler) newCSRFToken(w http.ResponseWriter) (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
@@ -162,13 +182,13 @@ func newCSRFToken(w http.ResponseWriter) (string, error) {
 		Name:     "csrf_token",
 		Value:    token,
 		HttpOnly: true,
+		Secure:   h.secureCookies,
 		SameSite: http.SameSiteStrictMode,
 		Path:     "/",
 	})
 	return token, nil
 }
 
-// validCSRF checks that the form's csrf_token matches the cookie.
 func validCSRF(r *http.Request) bool {
 	cookie, err := r.Cookie("csrf_token")
 	if err != nil {

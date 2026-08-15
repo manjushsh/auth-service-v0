@@ -17,23 +17,19 @@ import (
 )
 
 type dependencies struct {
-	db        *sql.DB
-	redis     *redis.Client
-	jwtSecret []byte
+	db    *sql.DB
+	redis *redis.Client
+	cfg   config
 }
 
 func main() {
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		log.Fatal("DATABASE_URL is not set")
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	jwtSecret := os.Getenv("JWT_SECRET")
-	if jwtSecret == "" {
-		log.Fatal("JWT_SECRET is not set")
-	}
-
-	database, err := db.Open(dsn)
+	// Connect to the database
+	database, err := db.Open(cfg.databaseURL)
 	if err != nil {
 		log.Fatalf("connect to db: %v", err)
 	}
@@ -45,28 +41,32 @@ func main() {
 	}
 	log.Println("migrations applied")
 
-	redisURL := os.Getenv("REDIS_URL")
-	if redisURL == "" {
-		redisURL = "redis://localhost:6379"
-	}
-	redisOpts, err := redis.ParseURL(redisURL)
+	// Connect to redis
+	redisOpts, err := redis.ParseURL(cfg.redisURL)
 	if err != nil {
 		log.Fatalf("parse redis url: %v", err)
 	}
 	redisClient := redis.NewClient(redisOpts)
-	if err := redisClient.Ping(context.Background()).Err(); err != nil {
+	pingCtx, cancelPing := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := redisClient.Ping(pingCtx).Err(); err != nil {
 		log.Fatalf("connect to redis: %v", err)
 	}
+	cancelPing()
 	defer redisClient.Close()
 	log.Println("connected to redis")
 
+	handler, err := newHandler(&dependencies{
+		db:    database,
+		redis: redisClient,
+		cfg:   cfg,
+	})
+	if err != nil {
+		log.Fatalf("build handler: %v", err)
+	}
+
 	srv := &http.Server{
-		Addr: ":8080",
-		Handler: newHandler(&dependencies{
-			db:        database,
-			redis:     redisClient,
-			jwtSecret: []byte(jwtSecret),
-		}),
+		Addr:         ":" + cfg.port,
+		Handler:      handler,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  60 * time.Second,
