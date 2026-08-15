@@ -1,0 +1,23 @@
+-- Keyset pagination index for GET /admin/users.
+--
+-- Every page of that endpoint sorts by (created_at DESC, id DESC) and, from the
+-- second page on, filters with the row-value comparison
+-- `(created_at, id) < ($cursor_time, $cursor_id)`. Without a matching composite
+-- index Postgres has no choice but to sequentially scan the whole users table
+-- and sort it, for every page — verified with `SET enable_seqscan = off`, which
+-- still produced a Seq Scan because no usable index existed.
+--
+-- The column order matches the sort exactly. A plain (created_at, id) would also
+-- serve, since btrees can be scanned backwards, but stating the direction keeps
+-- the index legible against the query it exists for — and stops it silently
+-- ceasing to apply if the sort ever becomes mixed-direction.
+--
+-- Note for a large live table: this form takes a brief ACCESS EXCLUSIVE lock.
+-- At that point build it as CREATE INDEX CONCURRENTLY, run outside the migration
+-- runner, since CONCURRENTLY cannot execute inside a transaction.
+CREATE INDEX IF NOT EXISTS users_created_at_idx ON users (created_at DESC, id DESC);
+
+-- Deliberately NOT added: the same composite on `clients`. That table holds one
+-- row per relying application — dozens, not millions — so the planner would
+-- never choose an index over a sequential scan, and it would be write overhead
+-- paid for nothing. Revisit only if client count ever reaches the thousands.

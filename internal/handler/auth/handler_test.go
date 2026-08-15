@@ -10,18 +10,20 @@ import (
 
 	model "github.com/manjushsh/auth-service/internal/model/auth"
 	svc "github.com/manjushsh/auth-service/internal/service/auth"
+	store "github.com/manjushsh/auth-service/internal/store/auth"
 )
 
 // fakeService lets each test stub exactly the call it exercises.
 type fakeService struct {
-	registerErr     error
-	generateCodeErr error
-	generateCode    model.GenerateCodeResponse
-	exchangeErr     error
-	exchange        model.ExchangeTokenResponse
-	logoutErr       error
-	introspect      model.IntrospectResponse
-	introspectErr   error
+	registerErr      error
+	generateCodeErr  error
+	generateCode     model.GenerateCodeResponse
+	exchangeErr      error
+	exchange         model.ExchangeTokenResponse
+	logoutErr        error
+	introspect       model.IntrospectResponse
+	introspectErr    error
+	passwordResetErr error
 }
 
 func (f *fakeService) Register(ctx context.Context, req model.RegisterRequest) error {
@@ -42,6 +44,10 @@ func (f *fakeService) Logout(ctx context.Context, tokenString string) error {
 
 func (f *fakeService) Introspect(ctx context.Context, tokenString string) (model.IntrospectResponse, error) {
 	return f.introspect, f.introspectErr
+}
+
+func (f *fakeService) RedeemPasswordReset(ctx context.Context, req model.PasswordResetRequest, meta store.RequestMeta) error {
+	return f.passwordResetErr
 }
 
 func TestGenerateCode_ErrorStatusMapping(t *testing.T) {

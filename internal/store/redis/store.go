@@ -2,6 +2,7 @@ package redis
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"time"
 
@@ -16,11 +17,27 @@ func NewRedisStore(client *redis.Client) *RedisStore {
 	return &RedisStore{client: client}
 }
 
-func codeKey(code string) string      { return fmt.Sprintf("auth:code:%s", code) }
-func blocklistKey(jti string) string  { return fmt.Sprintf("auth:blocklist:%s", jti) }
-func attemptsKey(email string) string { return fmt.Sprintf("auth:lockout:attempts:%s", email) }
-func lockedKey(email string) string   { return fmt.Sprintf("auth:lockout:locked:%s", email) }
-func rateLimitKey(key string) string  { return fmt.Sprintf("auth:ratelimit:%s", key) }
+func codeKey(code string) string     { return fmt.Sprintf("auth:code:%s", code) }
+func blocklistKey(jti string) string { return fmt.Sprintf("auth:blocklist:%s", jti) }
+func rateLimitKey(key string) string { return fmt.Sprintf("auth:ratelimit:%s", key) }
+func epochKey(userID string) string  { return fmt.Sprintf("auth:user:epoch:%s", userID) }
+
+// Lockout keys are scoped so independent failure budgets (password today, OTP
+// once MFA lands) cannot reset one another — a successful password login must
+// not hand an attacker a fresh OTP-guessing budget.
+func attemptsKey(scope, key string) string {
+	return fmt.Sprintf("auth:lockout:%s:attempts:%s", scope, key)
+}
+
+func lockedKey(scope, key string) string {
+	return fmt.Sprintf("auth:lockout:%s:locked:%s", scope, key)
+}
+
+// Reset tokens are keyed by their hash, never by the token itself, so a dump of
+// Redis is not a set of usable account-takeover credentials.
+func resetKey(hash []byte) string {
+	return fmt.Sprintf("auth:pwreset:%s", hex.EncodeToString(hash))
+}
 
 // incrWithExpire atomically increments key and, only on its first increment,
 // sets its TTL — all in one Lua script so a crash between INCR and EXPIRE

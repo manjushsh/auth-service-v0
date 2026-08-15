@@ -14,7 +14,7 @@ This document describes how the service is built, how data flows through it, and
                     │  load config → connect DB/Redis → serve  │
                     └───────────────────┬────────────────────--┘
                                         │
-                                routes.go (newHandler)
+                                wire.go (newHandler)
                                         │
         ┌───────────────────────────────┼───────────────────────────────┐
         │                               │                               │
@@ -40,41 +40,67 @@ This document describes how the service is built, how data flows through it, and
 
 ```
 cmd/server/            Composition root: config loading, dependency wiring, HTTP server lifecycle
-  main.go                Connects to Postgres/Redis, runs migrations, starts/stops the server
+  main.go                Connects to Postgres/Redis, runs migrations, starts/stops both servers
   config.go              Reads and validates environment variables into a config struct
-  routes.go              Builds the http.ServeMux, wires middleware and handlers
+  wire.go                Builds the service graph and both handler chains. Registers no
+                         routes itself: each handler package declares its own.
+cmd/adminctl/          One-shot CLI to promote/demote admin roles (bootstrap, break-glass)
 
 db/
   db.go                  sql.DB setup (pool tuning, ping) + embedded-migration runner
   migrations/             golang-migrate SQL files (embedded into the binary via go:embed)
 
 internal/
-  model/auth/            Wire types (request/response JSON structs) shared by handler + service
-  service/auth/          Business logic: registration, login, code issuance/exchange, JWT, lockout
-    service.go             Service implementation
-    deps.go                 Narrow interfaces the service depends on (codeStore, blocklist, locker)
-  store/auth/            User/client persistence
-    store.go                Store interface + shared errors (ErrDuplicate, ErrNotFound)
-    postgres.go             Postgres implementation (lib/pq)
-    memory.go               In-memory implementation, used only by tests
-  store/redis/            Redis-backed implementations of codeStore, blocklist, locker, rate limiter
+  token/                 JWT minting and parsing; owns the user/admin audience split
+    token.go                Manager: Mint/Parse (pure, no I/O)
+    verifier.go             Verifier: adds blocklist + session-epoch liveness checks
+  secret/                Random token generation and at-rest hashing
+  httpx/                 Shared HTTP helpers: JSON encode/decode, error bodies, bearer, client IP
+  model/auth/            Wire types for the public plane
+  model/admin/           Wire types for the admin plane
+  service/auth/          Credential and session mechanics: registration, login, codes, JWT,
+                         lockout, session revocation, password reset
+    service.go             Service implementation (Deps struct constructor)
+    password_reset.go       Reset token issuance + redemption
+    deps.go                 Narrow interfaces the service depends on
+  service/admin/         Administrative operations, orchestrating service/auth and the store
+    service.go             Caller, audit plumbing, health, shared helpers
+    auth.go                 Admin login, Authenticate, Authorize
+    users.go                Account *lifecycle* (admin tier): list, read, role, status, delete
+    recovery.go             Account *recovery* (support tier): unlock, revoke sessions,
+                            password reset — and, later, MFA reset
+    clients.go / audit.go
+  store/auth/            User/client/audit persistence
+    store.go                Domain types, roles, statuses, pagination, shared errors
+    postgres.go             Postgres implementation (lib/pq); audited mutations run in one tx
+    audit_postgres.go       Audit insert (tx-aware) + keyset query
+    memory.go               In-memory implementation, mirroring the same surface
+  store/redis/           Redis-backed volatile state
     store.go                Shared client wrapper, key helpers, atomic INCR+EXPIRE Lua script
     code.go                 One-time login codes (GETDEL for single-use redemption)
     blocklist.go            Revoked-JWT set (by jti)
-    locker.go               Failed-login counters + account lock flag
-    ratelimit.go             Fixed-window request counter
-  handler/auth/           JSON API handlers (thin: decode → call service → map errors → encode)
-  handler/ui/             Server-rendered login/register pages (HTML templates + CSRF)
-  middleware/             Cross-cutting HTTP concerns: security headers, body size limit, logging,
-                          per-IP rate limiting
+    locker.go               Scoped failed-login counters, lock flag, Unlock
+    epoch.go                Per-user session-revocation watermark
+    pwreset.go              Single-use password-reset tokens (stored hashed)
+    ratelimit.go            Fixed-window request counter
+  store/memory/          In-process mirror of store/redis: the test double for every service
+                         package, and a Redis-free mode for local runs
+  handler/auth/          JSON API handlers for the public plane
+    routes.go               Route table: path → rate-limit tier → handler
+  handler/admin/         JSON API handlers for the admin plane
+    handler.go              requireRole gate, error mapping, request helpers
+    routes.go               Route table: path → required role → handler
+  handler/ui/            Server-rendered login/register pages (HTML templates + CSRF)
+    routes.go               Route table for the hosted pages and static assets
+  middleware/            Cross-cutting HTTP concerns: security headers, body size limit, logging,
+                         per-IP rate limiting (two tiers: fail-open public, fail-closed admin)
 
-docs/                   This document
-IMPROVEMENTS.md         Open findings and recommended enhancements (security, reliability, roadmap)
+docs/                   This document, MFA_PLAN.md, ADMIN_API_PLAN.md
 ```
 
 ## 3. Request lifecycle
 
-Every request passes through the middleware chain in this order (outermost first, from `routes.go`):
+Every request passes through the middleware chain in this order (outermost first, from `wire.go`):
 
 1. **`SecurityHeaders`** — sets `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Content-Security-Policy` on every response.
 2. **`MaxBytes`** — wraps the request body in `http.MaxBytesReader` capped at 1 MiB, so an oversized body is rejected before it's read.
@@ -133,7 +159,18 @@ Two independent protections layer on top of each other:
 | Mechanism | Scope | Storage key | Behavior |
 |---|---|---|---|
 | Per-IP rate limit | `path + client IP` | `auth:ratelimit:<path>:<ip>` | Fixed-window counter; 429 + `Retry-After` when exceeded. Two tiers: tighter for credential-guessing routes, looser for token/logout/introspect. Fails **open** on Redis errors (logged) — availability is prioritized over the limit itself. |
-| Account lockout | `normalized email` | `auth:lockout:attempts:<email>`, `auth:lockout:locked:<email>` | After `MAX_LOGIN_ATTEMPTS` consecutive bad passwords, the account is locked for `LOCKOUT_DURATION`. A successful login clears the counter. Locking is keyed by email only — see [IMPROVEMENTS.md §1.2](../IMPROVEMENTS.md) for the known abuse case (an attacker can lock out a victim they don't control). |
+| Account lockout | `normalized email` | `auth:lockout:<scope>:attempts:<email>`, `auth:lockout:<scope>:locked:<email>` | After `MAX_LOGIN_ATTEMPTS` consecutive bad passwords, the account is locked for `LOCKOUT_DURATION`. A successful login clears the counter. Locking is keyed by email only — see [IMPROVEMENTS.md §1.2](../IMPROVEMENTS.md) for the known abuse case (an attacker can lock out a victim they don't control). The admin API can release a lock early (`POST /admin/users/{id}/unlock`), which is the mitigation that makes that abuse case tolerable. |
+| Session revocation | `user id` | `auth:user:epoch:<user_id>` | A watermark: every token issued at or before it stops introspecting as active. The only mechanism that can express "revoke everything for user X" — the blocklist is per-`jti` and nothing indexes a user's `jti`s. Bumped by admin revoke-sessions, suspension, role change, deletion and password reset. |
+
+`<scope>` exists so independent failure budgets can share one implementation. Only `pwd` is in
+use today; the MFA plan adds an `otp` scope whose counter a successful password login must not
+clear, or an attacker who already has the password would get an unbounded OTP-guessing budget.
+
+The epoch is compared as `iat <= epoch`, not `<`: JWT `iat` has one-second granularity, so a
+token minted in the same second as a revocation would survive a strict comparison. `ExchangeCode`
+applies the same rule to the authorization code's issue time, otherwise a code already in flight
+would redeem into a fresh token whose `iat` is *after* the epoch — a revocation hole one
+`CODE_TTL` wide.
 
 Both counters use the same atomic Lua script (`incrWithExpire` in `internal/store/redis/store.go`): `INCR` the key, and only on the *first* increment (count == 1) set its `EXPIRE`. Doing this in one round trip avoids a crash-between-INCR-and-EXPIRE leaving an unbounded, un-expiring counter.
 
@@ -168,7 +205,26 @@ All configuration is environment variables, loaded and validated once at startup
 | `LOCKOUT_DURATION` | `15m` | How long a locked account stays locked |
 | `BCRYPT_COST` | `10` | bcrypt cost factor (valid range 4–31); higher is slower but stronger |
 
-These map onto `authService.Config` (`internal/service/auth/service.go`) — a zero-value `Config{}` resolves to the same defaults, so the constructor is safe to call directly in tests without wiring env vars.
+### Optional — admin plane
+
+| Variable | Default | Description |
+|---|---|---|
+| `ADMIN_API_ENABLED` | `false` | Master switch; the admin listener does not start unless `true` |
+| `ADMIN_BIND_ADDR` | `127.0.0.1` | Interface for the admin listener. `0.0.0.0` should be a deliberate, reviewed change |
+| `ADMIN_PORT` | `8081` | Admin listener port |
+| `ADMIN_TOKEN_TTL` | `15m` | Admin JWT lifetime — deliberately much shorter than `TOKEN_TTL` |
+| `ADMIN_RATE_LIMIT_PER_MIN` | `60` | Per real peer IP, per route. Fails **closed** |
+| `ADMIN_PWRESET_TTL` | `15m` | Lifetime of an admin-issued password reset token |
+
+A kill switch is correct here and would be wrong for a security control: the failure mode of
+`ADMIN_API_ENABLED=false` is "an operator has to use psql", not "a protection stopped applying".
+Defaulting it off means an environment that never opted in has no admin plane to attack.
+
+Booleans are parsed with `strconv.ParseBool` and a malformed value is a startup error. A bare
+`== "true"` comparison would read `ADMIN_API_ENABLED=TRUE` as *false*; that direction happens to
+fail safe here, but the pattern must not spread to a flag where it would fail open.
+
+These map onto `authService.Config` and `adminService.Config` — a zero-value `Config{}` resolves to the same defaults, so both constructors are safe to call directly in tests without wiring env vars.
 
 ## 7. Data model
 
@@ -176,8 +232,28 @@ These map onto `authService.Config` (`internal/service/auth/service.go`) — a z
 
 | Table | Columns | Notes |
 |---|---|---|
-| `users` | `id UUID PK`, `email TEXT UNIQUE NOT NULL`, `password_hash TEXT NOT NULL`, `created_at` | Email is stored normalized (trimmed + lowercased) by the service layer before insert/lookup. |
-| `clients` | `id UUID PK`, `name TEXT`, `redirect_uri TEXT UNIQUE NOT NULL`, `created_at` | The allow-list of redirect URIs permitted to use hosted login. Populated manually (see README "Note" section) — there is no admin API yet. |
+| `users` | `id UUID PK`, `email TEXT UNIQUE NOT NULL`, `password_hash TEXT NOT NULL`, `role`, `status`, `created_at` | Email is stored normalized (trimmed + lowercased) by the service layer before insert/lookup. `role ∈ {user, support, admin}` and `status ∈ {active, suspended}`, both `CHECK`-constrained and defaulted so migration 005 is a no-op for existing rows. Indexed for the three access patterns that exist: unique on `email` (exact lookup), a **partial** index on `role <> 'user'` (privileged accounts are rare, so the index stays tiny), and a composite `(created_at DESC, id DESC)` for keyset pagination — without which every page of `GET /admin/users` was a full scan plus a sort. |
+| `clients` | `id UUID PK`, `name TEXT`, `redirect_uri TEXT NOT NULL`, `disabled_at`, `created_at` | The allow-list of redirect URIs permitted to use hosted login, managed through the [Admin API](../README.md#admin-api). Uniqueness is a **partial** index over live rows (`WHERE disabled_at IS NULL`), so a disabled URI can be re-registered — which is how a client rotation completes. |
+| `admin_audit_log` | `id BIGSERIAL PK`, `actor_*`, `action`, `target_*`, `result`, `metadata JSONB`, `remote_addr INET`, `forwarded_for`, `user_agent`, `created_at` | Append-only record of every privileged action, including denials. `actor_id` is `ON DELETE SET NULL`, not `CASCADE` — every other FK here cascades, but deleting an admin must not erase the record of what they did; `actor_email`/`actor_role` are snapshots for the same reason. `BIGSERIAL` rather than a UUID because this table is read in time order and paginated. |
+
+Mutations to `users` and `clients` go through store methods that **take an audit event** and write
+it on the same transaction. The signature is the enforcement: there is no way to change either
+table without supplying the record of who did it, and a failed audit write rolls the change back.
+The event is passed by pointer so a write can complete its own record — a created row's id, in
+particular, which does not exist until the INSERT returns.
+
+Two rules govern what reaches the table at all:
+
+- **Attributable actions only.** Failed authentication, and failed logins against addresses that
+  are unknown or unprivileged, go to the structured log instead. `/admin/auth/login` is
+  unauthenticated, so recording every attempt would let anyone able to reach the port write
+  unbounded rows about accounts that do not exist. A failed login against a real privileged
+  account *is* attributable, and is recorded.
+- **Session revocation precedes the change it accompanies.** Revocation lives in Redis and the
+  change in Postgres, so they cannot share a transaction and one must go first. Revoking first
+  makes a partial failure mean "logged out for a change that did not happen"; the other order
+  means "suspended, deleted or demoted with live tokens still working", which is the guarantee
+  those endpoints exist to provide. Revocation is idempotent, so the wasted bump costs a re-login.
 
 Migrations live in `db/migrations/`, are embedded into the binary via `go:embed`, and run automatically on every server start (`db.RunMigrations`, using `golang-migrate`). Migration `002` originally added a `sessions` table; migration `004` drops it again — the service turned out to be fully stateless (JWT + Redis), so nothing ever read or wrote it. It's kept as a migration pair rather than squashed, to preserve history for anyone who deployed between 002 and 004.
 
@@ -185,11 +261,21 @@ Migrations live in `db/migrations/`, are embedded into the binary via `go:embed`
 
 | Key pattern | Written by | Purpose | TTL |
 |---|---|---|---|
-| `auth:code:<code>` | `codeStore.StoreCode` | One-time login code → `{user_id, redirect_uri}` JSON | `CODE_TTL` (default 60s) |
+| `auth:code:<code>` | `codeStore.StoreCode` | One-time login code → `{user_id, redirect_uri, issued_at}` JSON | `CODE_TTL` (default 60s) |
 | `auth:blocklist:<jti>` | `blocklist.Revoke` | Revoked JWT IDs | remaining token lifetime at revocation time |
-| `auth:lockout:attempts:<email>` | `locker.RecordFailedAttempt` | Failed-login counter | `LOCKOUT_DURATION` |
-| `auth:lockout:locked:<email>` | `locker.LockAccount` | Lock flag (existence = locked) | `LOCKOUT_DURATION` |
+| `auth:lockout:<scope>:attempts:<email>` | `locker.RecordFailedAttempt` | Failed-login counter | `LOCKOUT_DURATION` |
+| `auth:lockout:<scope>:locked:<email>` | `locker.LockAccount` | Lock flag (existence = locked) | `LOCKOUT_DURATION` |
+| `auth:user:epoch:<user_id>` | `BumpEpoch` | Session-revocation watermark (unix seconds) | `2 × TOKEN_TTL` |
+| `auth:pwreset:<sha256(token)>` | `StoreResetToken` | Admin-issued reset token → user id | `ADMIN_PWRESET_TTL` (15m) |
 | `auth:ratelimit:<path>:<ip>` | middleware `RateLimit` | Fixed-window request counter | rate-limit window (1 minute) |
+
+Reset tokens are keyed by hash, never by the token itself, so a dump of Redis is not a set of
+usable account takeovers. A fast hash is correct rather than bcrypt: the tokens are 256 bits of
+`crypto/rand`, so there is nothing to brute-force and a slow KDF buys nothing.
+
+The epoch is the one key here without a natural TTL; giving it `2 × TOKEN_TTL` keeps the
+invariant below true, because once every token predating a bump has expired the watermark
+carries no information.
 
 Redis holds no data that needs to survive a flush — everything in it is either short-lived or reconstructible (a wiped blocklist just means already-issued tokens become valid again until they naturally expire; a wiped lockout counter just resets attempt counts). Postgres is the only store requiring backup/durability.
 
@@ -201,23 +287,40 @@ See the [README](../README.md#api) for the endpoint table and step-by-step flow.
 - `GenerateCodeRequest` / `GenerateCodeResponse` (used by both `/api/auth/login` and `/api/auth/code` — they're aliases of the same handler)
 - `ExchangeTokenRequest` (now includes `redirect_uri`, must match what the code was issued with) / `ExchangeTokenResponse`
 - `IntrospectResponse`
+- `PasswordResetRequest`
 
-Error responses are plain text (`http.Error`) with a status code; there is no structured error body format yet.
+Public-plane error responses are plain text (`http.Error`) with a status code.
+
+The admin plane is a **separate listener** with its own handler chain, its own wire types in
+`internal/model/admin`, and structured errors: `{"error": {"code": "...", "message": "..."}}`.
+That inconsistency is deliberate — the admin API is machine-consumed, and retrofitting the
+public plane would be a separate breaking change. Its endpoint table is in the
+[README](../README.md#admin-api); the design reasoning is in [ADMIN_API_PLAN.md](ADMIN_API_PLAN.md).
+
+Admin responses never carry a password hash: `model/admin.User` is a distinct type from
+`store.UserRecord` precisely so the hash has no field to be marshalled into.
 
 ## 9. Security posture summary
 
 Implemented:
 - bcrypt password hashing (configurable cost)
-- Timing-safe login (dummy-hash comparison on user-not-found)
-- Single-use, short-TTL, redirect-URI-bound authorization codes
+- Timing-safe login (dummy-hash comparison on user-not-found; the suspension check sits *after* the comparison so suspended accounts aren't detectable by response time)
+- Single-use, short-TTL, redirect-URI-bound authorization codes, re-validated against the client allow-list at redemption
 - JWT with mandatory `exp`, `iss`, `aud`, `jti` claims; explicit HMAC algorithm check (no `alg: none` confusion)
-- Server-side JWT revocation via blocklist (logout)
-- Account lockout after repeated failed logins
-- Per-IP, per-route rate limiting
-- CSRF double-submit cookie protection on the hosted HTML forms
-- Baseline security response headers + CSP
-- Request body size cap (1 MiB)
-- Minimum JWT secret length enforced at startup
+- **Audience split**: admin tokens carry `auth-service-admin` and are minted only by admin login, so a user JWT handed to a relying application can never open the admin plane
+- Server-side JWT revocation via blocklist (logout) and per-user session revocation via epoch
+- Account lockout after repeated failed logins, releasable early by an authenticated admin
+- Every password check — including admin login — routes through one lockout-aware helper, so no endpoint becomes an unthrottled password oracle
+- Per-IP, per-route rate limiting; the admin tier ignores proxy headers and fails closed
+- Admin plane on a separate listener, off by default, bound to loopback
+- Two-role authorization, re-read from the database on every request rather than trusted from the token
+- Last-admin and self-target guards, enforced inside the transaction
+- Confirmation echo on irreversible operations (delete user / delete client)
+- Durable, append-only audit log; a failed audit write fails the mutation
+- CSRF double-submit cookie protection on the hosted HTML forms; the admin plane is bearer-only so it has no ambient credential to ride
+- Baseline security response headers + CSP + `Cache-Control: no-store` on everything but `/static/`
+- Request body size cap (1 MiB public, 64 KiB admin)
+- Minimum JWT secret length enforced at startup; nil dependencies rejected by both service constructors
 
 Known gaps and their tracking items — see [IMPROVEMENTS.md](../IMPROVEMENTS.md) for full detail:
 - `X-Forwarded-For` is trusted unconditionally by the rate limiter, which is spoofable when the service is reachable directly (§1.1)
@@ -235,11 +338,19 @@ go test -race ./...    # with the race detector (recommended before merging conc
 ```
 
 Coverage by package:
-- `internal/service/auth` — the bulk of the business-logic tests, using fakes for `codeStore`/`blocklist`/`locker` (`service_test.go`) and the real in-memory `Store`.
+- `internal/service/auth` — the bulk of the business-logic tests. There are no hand-rolled fakes: `store/memory` mirrors the Redis implementation method for method, so these exercise the same paths production takes. An injectable clock drives the service, the token manager and the volatile store together, which is what makes the second-granular `iat <= epoch` boundary testable without sleeping.
+- `internal/service/admin` — admin operations against the *real* auth service, since the interaction between the two is the thing worth testing. Covers the last-admin and self-target guards, confirmation echoes, client lifecycle, keyset pagination, and an assertion that every mutation leaves exactly one audit record.
+- `internal/handler/admin` — the authorization table (below) plus end-to-end HTTP flows for the client lifecycle and support operations.
 - `internal/handler/auth` — HTTP status-code mapping from service errors, malformed-body handling.
 - `internal/middleware` — rate-limit allow/block/fail-open behavior.
 
-Not yet covered (see [IMPROVEMENTS.md §4](../IMPROVEMENTS.md)): the UI handler package, the Redis store implementations against a real/fake Redis, the Postgres store, and an end-to-end flow test wiring `routes.go` itself.
+**The authorization test is driven from the route table itself**, not a hand-maintained list.
+Every non-public route is asserted to reject an anonymous caller, a garbage token, a
+wrongly-signed token and — the one that matters most — a valid *user-audience* token for the
+same admin. A second test asserts that only login and health are public. Between them, an
+endpoint added without a role gate fails the suite instead of shipping open.
+
+Not yet covered (see [IMPROVEMENTS.md §4](../IMPROVEMENTS.md)): the UI handler package, the Redis store implementations against a real/fake Redis, and the Postgres store. Note in particular that the last-admin guard's correctness rests on `SELECT ... FOR UPDATE`; the in-memory store serializes everything behind a mutex, so a concurrent-demotion test passes there and proves nothing about Postgres.
 
 ## 11. Local development & deployment
 
@@ -254,7 +365,8 @@ Local dev and Docker Compose usage are documented in the [README](../README.md#l
 
 Some pointers for common changes, based on how the layering is structured:
 
-- **New API endpoint:** add a method to `internal/service/auth.Service` (and the narrow `service` interface in whichever handler package needs it), then wire a handler method + route in `routes.go`.
+- **New public API endpoint:** add a method to `internal/service/auth.Service` (and the narrow `service` interface in whichever handler package needs it), a handler method, then a row in that handler package's `Routes()`. The row is where the **rate-limit tier** is declared, and `TestRoutes_RateLimitTiers` fails until the new route is listed there too — so a credential endpoint cannot quietly land on the loose tier.
+- **New admin endpoint:** add the operation to `internal/service/admin`, a handler in `internal/handler/admin`, and a row in `Routes()` — the row is where the required role is declared, and the authorization test reads that table, so an endpoint cannot be added without choosing one. Mutations take a `store.AuditEvent`; Postgres ones get it written on the same transaction, Redis-backed ones call `s.record` and must propagate its error.
 - **New persistence need:** if it's relational (needs joins, constraints, uniqueness across restarts) it belongs in `internal/store/auth` + a migration; if it's ephemeral/keyed-lookup (TTL'd, counter-like) it belongs in `internal/store/redis`. Either way, define the interface in `internal/service/auth/deps.go` (or `store.go`) first, so the service package stays decoupled from the concrete backend — and so it stays testable with a fake.
 - **New config knob:** add a field to `authService.Config` (or `config` in `cmd/server` for non-service settings) with a `Default*` constant, wire it through `loadConfig`, and document it in the tables in §6 above and in `.env.example`.
 - **Roadmap features** (roles/authorization, refresh tokens, password reset, a client-management API, PKCE) are tracked in [IMPROVEMENTS.md §5](../IMPROVEMENTS.md).

@@ -3,8 +3,16 @@
   bin = "./tmp/server"
   entrypoint = "./tmp/server"
   include_ext = ["go"]
-  exclude_dir = ["tmp", "db"]
+  exclude_dir = ["tmp", "db", "docs"]
   delay = 1000
+  # Poll for changes instead of relying on inotify.
+  #
+  # The source tree reaches this container through a bind mount from the host,
+  # and filesystem events do not cross that boundary on Docker Desktop
+  # (Windows and macOS). Without polling, Air watches happily and never
+  # rebuilds — edits appear to be ignored until the container is restarted.
+  poll = true
+  poll_interval = 1000
 
 [log]
   time = false

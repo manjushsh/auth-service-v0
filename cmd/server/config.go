@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	adminService "github.com/manjushsh/auth-service/internal/service/admin"
 	authService "github.com/manjushsh/auth-service/internal/service/auth"
 )
 
@@ -13,6 +14,16 @@ import (
 const (
 	defaultRateLimitPerMin      = 10
 	defaultRateLimitTokenPerMin = 30
+	defaultAdminRateLimitPerMin = 60
+)
+
+// Admin listener defaults. Bound to loopback and disabled unless explicitly
+// switched on: until admin accounts have a second factor, the network boundary
+// is the primary control, and an environment that never opted in should have no
+// admin plane to attack.
+const (
+	defaultAdminBindAddr = "127.0.0.1"
+	defaultAdminPort     = "8081"
 )
 
 type config struct {
@@ -26,15 +37,26 @@ type config struct {
 	rateLimitPerMin      int
 	rateLimitTokenPerMin int
 	auth                 authService.Config
+
+	admin adminConfig
 }
+
+type adminConfig struct {
+	enabled         bool
+	bindAddr        string
+	port            string
+	rateLimitPerMin int
+	service         adminService.Config
+}
+
+func (a adminConfig) addr() string { return a.bindAddr + ":" + a.port }
 
 func loadConfig() (config, error) {
 	cfg := config{
-		databaseURL:     os.Getenv("DATABASE_URL"),
-		jwtSecret:       os.Getenv("JWT_SECRET"),
-		redisURL:        os.Getenv("REDIS_URL"),
-		port:            os.Getenv("SERVER_PORT"),
-		insecureCookies: os.Getenv("INSECURE_COOKIES") == "true",
+		databaseURL: os.Getenv("DATABASE_URL"),
+		jwtSecret:   os.Getenv("JWT_SECRET"),
+		redisURL:    os.Getenv("REDIS_URL"),
+		port:        os.Getenv("SERVER_PORT"),
 	}
 
 	if cfg.databaseURL == "" {
@@ -51,6 +73,9 @@ func loadConfig() (config, error) {
 	}
 
 	var err error
+	if cfg.insecureCookies, err = envBool("INSECURE_COOKIES", false); err != nil {
+		return config{}, err
+	}
 	if cfg.rateLimitPerMin, err = envInt("RATE_LIMIT_PER_MIN", defaultRateLimitPerMin); err != nil {
 		return config{}, err
 	}
@@ -72,7 +97,37 @@ func loadConfig() (config, error) {
 	if cfg.auth.BcryptCost, err = envInt("BCRYPT_COST", authService.DefaultBcryptCost); err != nil {
 		return config{}, err
 	}
+	if cfg.auth.PasswordResetTTL, err = envDuration("ADMIN_PWRESET_TTL", authService.DefaultPasswordResetTTL); err != nil {
+		return config{}, err
+	}
 
+	if cfg.admin, err = loadAdminConfig(); err != nil {
+		return config{}, err
+	}
+
+	return cfg, nil
+}
+
+func loadAdminConfig() (adminConfig, error) {
+	var (
+		cfg adminConfig
+		err error
+	)
+	if cfg.enabled, err = envBool("ADMIN_API_ENABLED", false); err != nil {
+		return adminConfig{}, err
+	}
+	if cfg.bindAddr = os.Getenv("ADMIN_BIND_ADDR"); cfg.bindAddr == "" {
+		cfg.bindAddr = defaultAdminBindAddr
+	}
+	if cfg.port = os.Getenv("ADMIN_PORT"); cfg.port == "" {
+		cfg.port = defaultAdminPort
+	}
+	if cfg.rateLimitPerMin, err = envInt("ADMIN_RATE_LIMIT_PER_MIN", defaultAdminRateLimitPerMin); err != nil {
+		return adminConfig{}, err
+	}
+	if cfg.service.TokenTTL, err = envDuration("ADMIN_TOKEN_TTL", adminService.DefaultTokenTTL); err != nil {
+		return adminConfig{}, err
+	}
 	return cfg, nil
 }
 
@@ -103,4 +158,23 @@ func envDuration(name string, def time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("%s: expected a positive duration like \"90s\" or \"15m\", got %q", name, raw)
 	}
 	return d, nil
+}
+
+// envBool accepts only the forms strconv.ParseBool recognises, and treats
+// anything else as a startup error.
+//
+// A bare `== "true"` comparison would read ADMIN_API_ENABLED=TRUE as *false*.
+// That direction happens to fail safe for this flag, but the same typo in a
+// future ADMIN_REQUIRE_MFA would disable a control silently, so the strictness
+// is the point.
+func envBool(name string, def bool) (bool, error) {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return def, nil
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("%s: expected a boolean like \"true\" or \"false\", got %q", name, raw)
+	}
+	return v, nil
 }

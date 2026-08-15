@@ -4,12 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log"
 	"net/http"
-	"strings"
 
+	"github.com/manjushsh/auth-service/internal/httpx"
 	model "github.com/manjushsh/auth-service/internal/model/auth"
 	svc "github.com/manjushsh/auth-service/internal/service/auth"
+	store "github.com/manjushsh/auth-service/internal/store/auth"
 )
 
 type service interface {
@@ -18,6 +18,7 @@ type service interface {
 	ExchangeCode(ctx context.Context, req model.ExchangeTokenRequest) (model.ExchangeTokenResponse, error)
 	Logout(ctx context.Context, tokenString string) error
 	Introspect(ctx context.Context, tokenString string) (model.IntrospectResponse, error)
+	RedeemPasswordReset(ctx context.Context, req model.PasswordResetRequest, meta store.RequestMeta) error
 }
 
 type Handler struct {
@@ -138,18 +139,35 @@ func (h *Handler) Introspect(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func extractBearerToken(r *http.Request) string {
-	token, found := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if !found {
-		return ""
+// RedeemPasswordReset completes an admin-issued password reset. It is
+// unauthenticated: the single-use token is the credential.
+func (h *Handler) RedeemPasswordReset(w http.ResponseWriter, r *http.Request) {
+	var req model.PasswordResetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
 	}
-	return token
+
+	meta := store.RequestMeta{
+		RemoteAddr:   httpx.RemoteIP(r),
+		ForwardedFor: r.Header.Get("X-Forwarded-For"),
+		UserAgent:    r.Header.Get("User-Agent"),
+	}
+	if err := h.svc.RedeemPasswordReset(r.Context(), req, meta); err != nil {
+		switch {
+		case errors.Is(err, svc.ErrInvalidResetToken):
+			http.Error(w, "invalid or expired reset token", http.StatusUnauthorized)
+		case errors.Is(err, svc.ErrBadRequest):
+			http.Error(w, "password does not meet requirements", http.StatusBadRequest)
+		default:
+			http.Error(w, "internal error", http.StatusInternalServerError)
+		}
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(v); err != nil {
-		log.Printf("writeJSON: encode error: %v", err)
-	}
-}
+func extractBearerToken(r *http.Request) string { return httpx.BearerToken(r) }
+
+func writeJSON(w http.ResponseWriter, status int, v any) { httpx.WriteJSON(w, status, v) }

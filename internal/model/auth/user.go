@@ -41,3 +41,10 @@ type IntrospectResponse struct {
 	Subject   string `json:"sub,omitempty"`
 	ExpiresAt int64  `json:"exp,omitempty"`
 }
+
+// PasswordResetRequest redeems an admin-issued reset token. Unauthenticated:
+// the token is the credential.
+type PasswordResetRequest struct {
+	ResetToken  string `json:"reset_token"`
+	NewPassword string `json:"new_password"`
+}

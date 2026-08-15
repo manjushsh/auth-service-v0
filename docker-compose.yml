@@ -39,6 +39,11 @@ services:
     restart: unless-stopped
     ports:
       - "${SERVER_PORT:-8080}:${SERVER_PORT:-8080}"
+      # Admin plane: bound to 0.0.0.0 *inside* the container (see
+      # ADMIN_BIND_ADDR below) but published only to the host's loopback, so the
+      # boundary the design relies on is preserved rather than abandoned.
+      # Nothing listens here unless ADMIN_API_ENABLED=true.
+      - "127.0.0.1:${ADMIN_PORT:-8081}:${ADMIN_PORT:-8081}"
     volumes:
       - .:/app
     environment:
@@ -47,6 +52,12 @@ services:
       JWT_SECRET: ${JWT_SECRET}
       INSECURE_COOKIES: ${INSECURE_COOKIES:-true}
       SERVER_PORT: ${SERVER_PORT:-8080}
+      ADMIN_API_ENABLED: ${ADMIN_API_ENABLED:-false}
+      ADMIN_PORT: ${ADMIN_PORT:-8081}
+      # A container's loopback is its own, so the default 127.0.0.1 would make
+      # the admin plane unreachable even from the host. Binding container-wide
+      # and publishing to host loopback (above) is the equivalent boundary.
+      ADMIN_BIND_ADDR: ${ADMIN_BIND_ADDR:-0.0.0.0}
     depends_on:
       postgres:
         condition: service_healthy

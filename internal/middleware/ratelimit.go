@@ -3,36 +3,67 @@ package middleware
 import (
 	"context"
 	"fmt"
-	"log"
-	"net"
+	"log/slog"
 	"net/http"
-	"strings"
 	"time"
+
+	"github.com/manjushsh/auth-service/internal/httpx"
 )
 
 type RateLimiter interface {
 	Allow(ctx context.Context, key string, limit int, window time.Duration) (bool, error)
 }
 
-// RateLimit returns middleware that allows at most limit requests per window per real IP.
-// Requests that exceed the limit get a 429 with a Retry-After header.
+// RateLimitOptions configures one limiter tier.
+type RateLimitOptions struct {
+	Limit  int
+	Window time.Duration
+
+	// TrustProxyHeaders keys the limit on X-Forwarded-For / X-Real-IP when
+	// present. Convenient behind a proxy, spoofable without one.
+	TrustProxyHeaders bool
+
+	// FailOpen serves the request when the limiter itself errors. The public
+	// plane sets this: availability is prioritized over the limit. The admin
+	// plane does not — it is low-traffic and internal, so a limiter outage
+	// there should not silently remove the protection.
+	FailOpen bool
+}
+
+// RateLimit is the public-plane tier: proxy headers trusted, fails open.
 func RateLimit(rl RateLimiter, limit int, window time.Duration) func(http.Handler) http.Handler {
+	return RateLimitWith(rl, RateLimitOptions{
+		Limit:             limit,
+		Window:            window,
+		TrustProxyHeaders: true,
+		FailOpen:          true,
+	})
+}
+
+// RateLimitWith returns middleware allowing at most opts.Limit requests per
+// window per client, per route.
+func RateLimitWith(rl RateLimiter, opts RateLimitOptions) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			ip := realIP(r)
+			ip := httpx.RemoteIP(r)
+			if opts.TrustProxyHeaders {
+				ip = httpx.ClientIP(r)
+			}
 			key := fmt.Sprintf("%s:%s", r.URL.Path, ip)
 
-			allowed, err := rl.Allow(r.Context(), key, limit, window)
+			allowed, err := rl.Allow(r.Context(), key, opts.Limit, opts.Window)
 			if err != nil {
-				// Fail open: don't block requests on Redis errors, but log it
-				// since silent failures here mean rate limiting is off.
-				log.Printf("ratelimit: %s: %v", key, err)
+				slog.Error("ratelimit", "key", key, "fail_open", opts.FailOpen, "error", err)
+				if !opts.FailOpen {
+					http.Error(w, "rate limiter unavailable", http.StatusServiceUnavailable)
+					return
+				}
 				next.ServeHTTP(w, r)
 				return
 			}
 
 			if !allowed {
-				w.Header().Set("Retry-After", fmt.Sprintf("%d", int(window.Seconds())))
+				w.Header().Set("Retry-After", fmt.Sprintf("%d", int(opts.Window.Seconds())))
 				http.Error(w, "too many requests", http.StatusTooManyRequests)
 				return
 			}
@@ -40,20 +71,4 @@ func RateLimit(rl RateLimiter, limit int, window time.Duration) func(http.Handle
 			next.ServeHTTP(w, r)
 		})
 	}
-}
-
-// realIP extracts the client IP from proxy headers or the remote address.
-func realIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// X-Forwarded-For is a comma-separated list; leftmost entry is the client.
-		return strings.TrimSpace(strings.SplitN(xff, ",", 2)[0])
-	}
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
 }

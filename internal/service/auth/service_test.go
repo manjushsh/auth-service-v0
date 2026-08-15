@@ -11,126 +11,159 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	model "github.com/manjushsh/auth-service/internal/model/auth"
+	"github.com/manjushsh/auth-service/internal/secret"
 	store "github.com/manjushsh/auth-service/internal/store/auth"
+	"github.com/manjushsh/auth-service/internal/store/memory"
+	"github.com/manjushsh/auth-service/internal/token"
 )
 
-// --- fakes for the narrow interfaces in deps.go ---
-
-type fakeCode struct {
-	userID      string
-	redirectURI string
+// testDeps is the wiring every test shares, exposed so individual tests can
+// reach into a collaborator without rebuilding the graph.
+//
+// Note there are no hand-rolled fakes: memory.Store mirrors the Redis
+// implementation method for method, so these tests exercise the same paths
+// production takes rather than a simplification of them.
+type testDeps struct {
+	store    *store.MemoryStore
+	volatile *memory.Store
+	tokens   *token.Manager
+	clock    *testClock
+	service  *Service
 }
 
-type fakeCodeStore struct {
-	mu    sync.Mutex
-	codes map[string]fakeCode
+// testClock drives every time source in the graph — the service, the token
+// manager and the volatile store — from one place. Session revocation is
+// second-granular, so tests that need to cross a second boundary advance this
+// rather than sleeping.
+type testClock struct {
+	mu sync.Mutex
+	at time.Time
 }
 
-func newFakeCodeStore() *fakeCodeStore { return &fakeCodeStore{codes: map[string]fakeCode{}} }
-
-func (f *fakeCodeStore) StoreCode(ctx context.Context, code, userID, redirectURI string, ttl time.Duration) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.codes[code] = fakeCode{userID: userID, redirectURI: redirectURI}
-	return nil
+func newTestClock() *testClock {
+	return &testClock{at: time.Now().UTC().Truncate(time.Second)}
 }
 
-func (f *fakeCodeStore) RedeemCode(ctx context.Context, code string) (string, string, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	c, ok := f.codes[code]
-	if !ok {
-		return "", "", errors.New("code not found")
+func (c *testClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.at
+}
+
+func (c *testClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.at = c.at.Add(d)
+}
+
+func testSecret() []byte { return []byte(strings.Repeat("s", token.MinSecretLen)) }
+
+func newTestDeps(t *testing.T, allowedRedirects ...string) *testDeps {
+	t.Helper()
+
+	st := store.NewMemoryStore(allowedRedirects...)
+	vol := memory.New()
+	clock := newTestClock()
+	vol.SetClock(clock.Now)
+
+	tokens, err := token.NewManager(testSecret(), secret.NewToken, clock.Now)
+	if err != nil {
+		t.Fatalf("token.NewManager: %v", err)
 	}
-	delete(f.codes, code)
-	return c.userID, c.redirectURI, nil
+
+	deps := newDeps(st, vol, tokens)
+	deps.Now = clock.Now
+
+	// MinCost keeps the bcrypt-heavy tests fast.
+	svc, err := New(deps, Config{BcryptCost: bcrypt.MinCost})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return &testDeps{store: st, volatile: vol, tokens: tokens, clock: clock, service: svc}
 }
 
-type fakeBlocklist struct {
-	mu      sync.Mutex
-	revoked map[string]bool
-}
-
-func newFakeBlocklist() *fakeBlocklist { return &fakeBlocklist{revoked: map[string]bool{}} }
-
-func (f *fakeBlocklist) Revoke(ctx context.Context, jti string, ttl time.Duration) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.revoked[jti] = true
-	return nil
-}
-
-func (f *fakeBlocklist) IsRevoked(ctx context.Context, jti string) (bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.revoked[jti], nil
-}
-
-type fakeLocker struct {
-	mu       sync.Mutex
-	attempts map[string]int
-	locked   map[string]bool
-}
-
-func newFakeLocker() *fakeLocker {
-	return &fakeLocker{attempts: map[string]int{}, locked: map[string]bool{}}
-}
-
-func (f *fakeLocker) IsLocked(ctx context.Context, email string) (bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.locked[email], nil
-}
-
-func (f *fakeLocker) RecordFailedAttempt(ctx context.Context, email string, ttl time.Duration) (int, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.attempts[email]++
-	return f.attempts[email], nil
-}
-
-func (f *fakeLocker) LockAccount(ctx context.Context, email string, ttl time.Duration) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.locked[email] = true
-	return nil
-}
-
-func (f *fakeLocker) ClearFailedAttempts(ctx context.Context, email string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	delete(f.attempts, email)
-	return nil
+// newDeps builds a fully-wired dependency set, so tests that need to drop one
+// collaborator start from something valid.
+func newDeps(st *store.MemoryStore, vol *memory.Store, tokens *token.Manager) Deps {
+	return Deps{
+		Store:     st,
+		Codes:     vol,
+		Blocklist: vol,
+		Locker:    vol,
+		Epochs:    vol,
+		Resets:    vol,
+		Audit:     st,
+		Tokens:    tokens,
+	}
 }
 
 func newTestService(t *testing.T, allowedRedirects ...string) (*Service, *store.MemoryStore) {
 	t.Helper()
-	st := store.NewMemoryStore(allowedRedirects...)
-	secret := []byte(strings.Repeat("s", minJWTSecretLen))
-	// MinCost keeps the bcrypt-heavy tests fast.
-	cfg := Config{BcryptCost: bcrypt.MinCost}
-	svc, err := New(st, newFakeCodeStore(), newFakeBlocklist(), newFakeLocker(), secret, cfg)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	return svc, st
+	d := newTestDeps(t, allowedRedirects...)
+	return d.service, d.store
 }
 
 const testPassword = "correct-horse-battery-staple"
 
-func TestNew_RejectsShortSecret(t *testing.T) {
-	st := store.NewMemoryStore()
-	_, err := New(st, newFakeCodeStore(), newFakeBlocklist(), newFakeLocker(), []byte("too-short"), Config{})
-	if err == nil {
+// registerUser creates an account and returns its stored record.
+func registerUser(t *testing.T, svc *Service, st *store.MemoryStore, email string) store.UserRecord {
+	t.Helper()
+	err := svc.Register(context.Background(), model.RegisterRequest{
+		Credentials: model.Credentials{Email: email, Password: testPassword},
+	})
+	if err != nil {
+		t.Fatalf("Register(%s): %v", email, err)
+	}
+	u, err := st.GetUser(context.Background(), email)
+	if err != nil {
+		t.Fatalf("GetUser(%s): %v", email, err)
+	}
+	return u
+}
+
+func TestNewManager_RejectsShortSecret(t *testing.T) {
+	if _, err := token.NewManager([]byte("too-short"), secret.NewToken, time.Now); err == nil {
 		t.Fatal("expected error for short jwt secret")
 	}
 }
 
+// A nil dependency reaching production is a silent security bypass, so the
+// constructor must refuse rather than build a half-wired service.
+func TestNew_RejectsNilDependency(t *testing.T) {
+	tokens, err := token.NewManager(testSecret(), secret.NewToken, time.Now)
+	if err != nil {
+		t.Fatalf("token.NewManager: %v", err)
+	}
+	full := newDeps(store.NewMemoryStore(), memory.New(), tokens)
+
+	cases := map[string]func(*Deps){
+		"Store":     func(d *Deps) { d.Store = nil },
+		"Codes":     func(d *Deps) { d.Codes = nil },
+		"Blocklist": func(d *Deps) { d.Blocklist = nil },
+		"Locker":    func(d *Deps) { d.Locker = nil },
+		"Epochs":    func(d *Deps) { d.Epochs = nil },
+		"Resets":    func(d *Deps) { d.Resets = nil },
+		"Audit":     func(d *Deps) { d.Audit = nil },
+		"Tokens":    func(d *Deps) { d.Tokens = nil },
+	}
+	for name, drop := range cases {
+		t.Run(name, func(t *testing.T) {
+			d := full
+			drop(&d)
+			if _, err := New(d, Config{BcryptCost: bcrypt.MinCost}); err == nil {
+				t.Fatalf("expected New to reject a nil %s", name)
+			}
+		})
+	}
+}
+
 func TestNew_RejectsOutOfRangeBcryptCost(t *testing.T) {
-	st := store.NewMemoryStore()
-	secret := []byte(strings.Repeat("s", minJWTSecretLen))
-	_, err := New(st, newFakeCodeStore(), newFakeBlocklist(), newFakeLocker(), secret, Config{BcryptCost: bcrypt.MaxCost + 1})
-	if err == nil {
+	tokens, err := token.NewManager(testSecret(), secret.NewToken, time.Now)
+	if err != nil {
+		t.Fatalf("token.NewManager: %v", err)
+	}
+	deps := newDeps(store.NewMemoryStore(), memory.New(), tokens)
+	if _, err := New(deps, Config{BcryptCost: bcrypt.MaxCost + 1}); err == nil {
 		t.Fatal("expected error for out-of-range bcrypt cost")
 	}
 }
